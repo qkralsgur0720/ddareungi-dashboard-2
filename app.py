@@ -628,30 +628,61 @@ def build_candidates(
     deliveries["필요량"] = deliveries["재배치필요량"]
     deliveries["수거후보구분"] = "-"
 
-    # 3) 과잉 후보가 부족하면, 현재 자전거가 있는 대여소 중 예비 수거 후보를 추가한다.
-    #    예비 수거는 해당 대여소를 부족 기준 아래로 떨어뜨리지 않는 범위에서만 허용한다.
+    # 3) 실제 과잉 후보가 부족하면 "공급 수거 후보"를 만든다.
+    #    현실적으로 실시간 재배치에서는 모든 시간대에 과잉 대여소가 존재하지 않을 수 있다.
+    #    이때는 현재 자전거가 많고, 과거/예측 기준으로 당장 대여수요가 낮은 대여소를 공급원으로 사용한다.
+    #    단, 해당 대여소를 완전히 비우지 않도록 최소 잔여량을 남긴다.
     need_more_pickups = max(0, int(top_pickup) - len(pickups))
     delivery_keys = set(deliveries["station_key"].astype(str)) if not deliveries.empty else set()
     pickup_keys = set(pickups["station_key"].astype(str)) if not pickups.empty else set()
     if need_more_pickups > 0:
-        reserve = np.maximum(np.ceil(df["부족기준"]), 1)
-        df["예비수거가능량"] = np.maximum(0, np.floor(df["현재자전거수"] - reserve)).astype(int)
+        # 1차 안전재고: 부족 기준 L보다 조금 완화한 15% 또는 1대 중 큰 값
+        # 너무 보수적으로 잡으면 수거 후보가 0개가 되어 경로가 생성되지 않으므로 발표/시연용 공급 후보 기준을 둔다.
+        reserve_soft = np.maximum(1, np.floor(0.15 * df["거치대수"]))
+        df["예비수거가능량"] = np.maximum(0, np.floor(df["현재자전거수"] - reserve_soft)).astype(int)
+
         fallback = df[
             (df["예비수거가능량"] > 0)
             & (~df["station_key"].astype(str).isin(delivery_keys))
             & (~df["station_key"].astype(str).isin(pickup_keys))
         ].copy()
+
+        if fallback.empty:
+            # 그래도 없으면 최소 2대 이상 보유한 대여소에서 1대 이상 수거 가능하게 둔다.
+            # 이는 실제 과잉이 아니라 "공급원 후보"이며, 발표에서는 휴리스틱 가정으로 설명한다.
+            fallback = df[
+                (df["현재자전거수"] >= 2)
+                & (~df["station_key"].astype(str).isin(delivery_keys))
+                & (~df["station_key"].astype(str).isin(pickup_keys))
+            ].copy()
+            if not fallback.empty:
+                fallback["예비수거가능량"] = np.maximum(1, np.floor(fallback["현재자전거수"] * 0.35)).astype(int)
+
         if not fallback.empty:
-            # 현재 자전거가 많고, 우선순위가 높은 곳을 먼저 예비 수거지로 사용
-            fallback["예비수거점수"] = fallback["예비수거가능량"] * 0.7 + fallback["우선순위기초점수"] * 10 * 0.3
+            # 현재 자전거가 많을수록 + 예측 대여수요가 낮을수록 + 평소 이용 빈도가 낮을수록 공급 후보로 적합
+            def _mm(x):
+                x = pd.to_numeric(x, errors="coerce").fillna(0)
+                return (x - x.min()) / (x.max() - x.min()) if x.max() != x.min() else x * 0
+
+            fallback["현재재고점수"] = _mm(fallback["현재자전거수"])
+            fallback["낮은예측대여점수"] = 1 - _mm(fallback["예측대여수요"])
+            if "평소이용빈도" in fallback.columns:
+                fallback["낮은이용빈도점수"] = 1 - _mm(fallback["평소이용빈도"])
+            else:
+                fallback["낮은이용빈도점수"] = 0.5
+
+            fallback["예비수거점수"] = (
+                0.55 * fallback["현재재고점수"]
+                + 0.30 * fallback["낮은예측대여점수"]
+                + 0.15 * fallback["낮은이용빈도점수"]
+            )
             fallback = fallback.sort_values("예비수거점수", ascending=False).head(need_more_pickups)
             fallback["후보유형"] = "수거"
-            fallback["필요량"] = fallback["예비수거가능량"].clip(lower=1)
+            fallback["필요량"] = fallback["예비수거가능량"].clip(lower=1, upper=int(max(1, capacity if 'capacity' in globals() else 15))) if False else fallback["예비수거가능량"].clip(lower=1)
             fallback["수거필요량"] = fallback["필요량"]
             fallback["재배치필요량"] = 0
-            # 예비 수거지는 '공급원'이므로 기존 불균형을 키우지 않도록 처리전불균형은 0으로 둔다.
             fallback["처리전불균형"] = 0
-            fallback["수거후보구분"] = "예비수거"
+            fallback["수거후보구분"] = "공급수거"
             pickups = pd.concat([pickups, fallback], ignore_index=True)
 
     cand = pd.concat([pickups, deliveries], ignore_index=True)
@@ -959,6 +990,56 @@ def add_station_marker(m: folium.Map, node: Dict[str, Any], seq: int) -> None:
     ).add_to(m)
 
 
+def make_realtime_status_map(bike_df: pd.DataFrame, candidates: pd.DataFrame, depot_lat: float, depot_lon: float) -> folium.Map:
+    """실시간 전체 대여소 현황 지도.
+    색상: 빨강=수거/공급 후보, 파랑=재배치 후보, 회색=일반 대여소.
+    원 크기: 현재 자전거 수가 많을수록 크게 표시.
+    """
+    m = folium.Map(location=[depot_lat, depot_lon], zoom_start=14, tiles="CartoDB positron")
+    folium.Marker([depot_lat, depot_lon], tooltip="출발지: 여의도 복지관", popup="<b>출발지</b><br>여의도 복지관", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
+
+    cand_type = {}
+    if candidates is not None and not candidates.empty:
+        for _, r in candidates.iterrows():
+            cand_type[str(r.get("station_key", ""))] = str(r.get("후보유형", ""))
+
+    if bike_df is None or bike_df.empty:
+        return m
+
+    for _, r in bike_df.iterrows():
+        lat = to_float(r.get("위도", np.nan), np.nan)
+        lon = to_float(r.get("경도", np.nan), np.nan)
+        if pd.isna(lat) or pd.isna(lon) or lat == 0 or lon == 0:
+            continue
+        key = str(r.get("station_key", ""))
+        cur = to_float(r.get("현재자전거수", 0), 0)
+        rack = max(1, to_float(r.get("거치대수", 1), 1))
+        ratio = cur / rack
+        typ = cand_type.get(key, "")
+        if typ == "수거":
+            color = "red"
+        elif typ == "재배치":
+            color = "blue"
+        elif ratio >= 0.7:
+            color = "orange"
+        elif ratio <= 0.2:
+            color = "lightblue"
+        else:
+            color = "gray"
+        radius = min(12, max(4, 3 + cur * 0.45))
+        name = r.get("대여소명_API", r.get("대여소명", ""))
+        folium.CircleMarker(
+            [lat, lon],
+            radius=radius,
+            color=color,
+            fill=True,
+            fill_opacity=0.65,
+            tooltip=f"{name} | 현재 {cur:.0f}대 / 거치대 {rack:.0f}대",
+            popup=f"<b>{name}</b><br>현재 자전거: {cur:.0f}대<br>거치대: {rack:.0f}대<br>거치율: {ratio*100:.1f}%<br>후보유형: {typ or '일반'}",
+        ).add_to(m)
+    return m
+
+
 def make_overview_map(candidates: pd.DataFrame, depot_lat: float, depot_lon: float) -> folium.Map:
     m = folium.Map(location=[depot_lat, depot_lon], zoom_start=14, tiles="CartoDB positron")
     folium.Marker([depot_lat, depot_lon], tooltip="출발지", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
@@ -1021,10 +1102,10 @@ def make_vehicle_route_map(route: List[Dict[str, Any]], vehicle_no: int) -> Tupl
 # ============================================================
 
 st.title("🚲 여의도 따릉이 수거·재배치 경로 추천 대시보드")
-st.caption("배포용 버전: 실시간 API + 과거 수요모델 + 휴리스틱 경로 추천. 출발지는 여의도 복지관으로 고정하고, 차량별 경로 지도는 각각 분리해서 표시합니다. 차량은 빈 차량으로 출발해 수거 후 재배치하며, 마지막 재배치 지점에서 경로를 마무리합니다.")
+st.caption("배포용 버전: 실시간 API + 과거 수요모델 + 휴리스틱 경로 추천. 출발지는 여의도 복지관으로 고정하고, 차량별 경로 지도는 각각 분리해서 표시합니다. 차량은 빈 차량으로 출발해 공급 수거 후보에서 자전거를 수거한 뒤 재배치 지점에서 경로를 마무리합니다.")
 
 # session state 초기화
-for key in ["candidates", "routes", "processed", "summary", "weather", "weather_cond", "ctx"]:
+for key in ["candidates", "routes", "processed", "summary", "weather", "weather_cond", "ctx", "bike_y"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -1084,7 +1165,7 @@ run_clicked = col_run.button("경로 추천 실행", type="primary", use_contain
 clear_clicked = col_clear.button("초기화", use_container_width=True)
 
 if clear_clicked:
-    for key in ["candidates", "routes", "processed", "summary", "weather", "weather_cond", "ctx"]:
+    for key in ["candidates", "routes", "processed", "summary", "weather", "weather_cond", "ctx", "bike_y"]:
         st.session_state[key] = None
     st.rerun()
 
@@ -1127,6 +1208,7 @@ if run_clicked:
             st.session_state.weather = weather
             st.session_state.weather_cond = weather_cond
             st.session_state.ctx = ctx
+            st.session_state.bike_y = bike_y
             st.success("경로 추천이 완료되었습니다.")
 
 
@@ -1161,6 +1243,7 @@ ctx = st.session_state.ctx or current_time_context()
 candidates = st.session_state.candidates
 processed = st.session_state.processed
 routes = st.session_state.routes
+bike_y = st.session_state.bike_y
 
 # ① 현재 조건
 st.subheader("① 현재 조건")
@@ -1178,8 +1261,14 @@ metric_grid([
     ("날씨 업데이트", str(weather.get("WEATHER_TIME", "-"))),
 ])
 
-# ② 개선 효과
-st.subheader("② 수거·재배치 후보 및 개선 효과")
+# ② 실시간 대여소 현황 지도
+st.subheader("② 실시간 대여소 현황 지도")
+st.caption("여의도 대여소의 현재 자전거 수를 보여줍니다. 빨강은 수거/공급 후보, 파랑은 재배치 후보, 주황은 현재 자전거가 많은 일반 대여소입니다.")
+status_map = make_realtime_status_map(bike_y, candidates, depot_lat, depot_lon)
+st_folium(status_map, width=None, height=480, returned_objects=[])
+
+# ③ 개선 효과
+st.subheader("③ 수거·재배치 후보 및 개선 효과")
 metric_grid([
     ("처리 전 후보 불균형", f"{summary['before']:.0f}대"),
     ("휴리스틱 처리량", f"{summary['processed']:.0f}대"),
@@ -1201,7 +1290,7 @@ with st.expander("계산 기준과 해석 보기", expanded=False):
         재배치필요량 = max(0, L×거치대수 - 예상재고), 현재 L = <b>{L:.2f}</b><br><br>
         <b>4. 경로 추천 방식</b><br>
         배포용 대시보드는 Gurobi가 아니라 휴리스틱 방식입니다. 차량은 여의도 복지관에서 빈 차량으로 출발하고, 먼저 수거 후보를 방문해 자전거를 싣습니다. 이후 재배치 후보를 방문해 부족 대여소에 배치합니다.<br>
-        실제 과잉 수거 후보가 부족한 경우에는 현재 자전거가 비교적 많은 대여소를 예비 수거 후보로 사용합니다. 단, 해당 대여소가 부족 기준 이하로 떨어지지 않는 범위에서만 수거 가능량을 잡습니다.<br>
+        실제 과잉 수거 후보가 부족한 경우에는 현재 자전거 수가 많고, 예측 대여수요와 평소 이용 빈도가 낮은 대여소를 공급 수거 후보로 사용합니다. 이 후보는 부족 대여소를 채우기 위한 공급원이며, 가능한 한 최소 잔여 자전거를 남기도록 계산합니다.<br>
         출발지는 여의도 복지관으로 고정했습니다. 시간 조건은 Streamlit 서버 시간이 아니라 한국시간(KST)을 기준으로 판정합니다.<br>차량 1대가 모든 후보를 처리하지 않도록 재배치 후보를 후보점수 순으로 차량별 균등 배정하고, 각 차량은 수거→재배치 순서로 경로를 구성합니다.<br>각 차량 지도는 OSRM 도로 경로를 호출해 실제 도로 흐름에 가깝게 표시하며, 경로 선 위의 화살표가 진행 방향을 나타냅니다. 복귀선은 그리지 않고 마지막 재배치 지점에서 경로가 끝납니다.
         </div>
         """,
@@ -1219,13 +1308,13 @@ with col2:
     st.dataframe(candidates[candidates["후보유형"] == "재배치"][[c for c in cols if c in candidates.columns]], use_container_width=True, hide_index=True)
 
 # 후보 개요 지도
-st.subheader("③ 후보 위치 개요 지도")
+st.subheader("④ 후보 위치 개요 지도")
 st.caption("이 지도는 후보 위치만 보여줍니다. 차량 경로는 아래 차량별 지도에서 따로 확인합니다.")
 overview_map = make_overview_map(candidates, depot_lat, depot_lon)
 st_folium(overview_map, width=None, height=480, returned_objects=[])
 
 # 차량별 경로 지도
-st.subheader("④ 차량별 경로 지도")
+st.subheader("⑤ 차량별 경로 지도")
 st.caption("각 탭에는 해당 차량의 경로만 표시됩니다. 초록색 선은 OSRM 도로 경로이며, 선 위의 큰 삼각 화살표가 진행 방향입니다. 복귀 경로는 표시하지 않고 마지막 재배치 지점에서 종료합니다.")
 
 tabs = st.tabs([f"차량 {i+1}" for i in range(len(routes))])
@@ -1246,7 +1335,7 @@ for i, tab in enumerate(tabs):
         route_tables.append(table)
 
 # 처리 결과표
-st.subheader("⑤ 처리 결과 상세")
+st.subheader("⑥ 처리 결과 상세")
 show_cols = [
     "대여소명", "후보유형", "수거후보구분", "필요량", "현재자전거수", "거치대수", "예상재고", "처리수거량", "처리재배치량", "남은수거", "남은재배치", "남은불균형"
 ]
