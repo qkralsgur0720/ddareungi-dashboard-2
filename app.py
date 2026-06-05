@@ -458,17 +458,31 @@ def build_map(candidates: pd.DataFrame, routes: pd.DataFrame, start_lat: float, 
 # 화면 구성
 # -----------------------------
 st.title("🚲 여의도 따릉이 실시간 수거·재배치 경로 추천 데모")
-st.caption("실시간 API + 과거 수요모델 + 휴리스틱 경로 추천으로 수거·재배치 후보와 차량별 경로를 시각화합니다. 배포용 버전이므로 Gurobi는 포함하지 않습니다.")
+st.caption(
+    "실시간 API + 과거 수요모델 + 휴리스틱 경로 추천으로 "
+    "수거·재배치 후보와 차량별 경로를 시각화합니다. 배포용 버전이므로 Gurobi는 포함하지 않습니다."
+)
 
 data = load_csv_data()
 thresholds = parse_thresholds(data["thresholds"])
 
+# 결과가 Streamlit rerun 때문에 사라지지 않도록 세션에 저장
+if "route_bundle" not in st.session_state:
+    st.session_state.route_bundle = None
+
+# API 키는 화면에 노출하지 않고 Streamlit Cloud Secrets에서만 불러옴
+bike_key = get_secret_or_empty("SEOUL_BIKE_API_KEY")
+city_key = get_secret_or_empty("SEOUL_CITYDATA_API_KEY")
+
 with st.sidebar:
     st.header("⚙️ 실행 설정")
-    bike_key_default = get_secret_or_empty("SEOUL_BIKE_API_KEY")
-    city_key_default = get_secret_or_empty("SEOUL_CITYDATA_API_KEY")
-    bike_key = st.text_input("따릉이 API 키", value=bike_key_default, type="password")
-    city_key = st.text_input("도시데이터 API 키", value=city_key_default, type="password")
+
+    if bike_key and city_key:
+        st.success("API 키 로드 완료")
+        st.caption("API 키는 Streamlit Secrets에서 자동으로 불러옵니다.")
+    else:
+        st.error("API 키가 아직 설정되지 않았습니다.")
+        st.caption("Streamlit Cloud → App settings → Secrets에 API 키를 넣어주세요.")
 
     places = data["places"].copy()
     default_idx = 0
@@ -506,8 +520,12 @@ with st.sidebar:
         st.caption(f"{preset}: {start_lat:.6f}, {start_lon:.6f}")
 
     run = st.button("실시간 경로 추천 실행", type="primary", use_container_width=True)
+    clear = st.button("결과 초기화", use_container_width=True)
 
-# 설명 박스
+if clear:
+    st.session_state.route_bundle = None
+    st.rerun()
+
 with st.expander("이 대시보드가 하는 일", expanded=False):
     st.markdown(
         """
@@ -521,7 +539,77 @@ with st.expander("이 대시보드가 하는 일", expanded=False):
         """
     )
 
-if not run:
+# 버튼을 눌렀을 때만 API와 경로 추천을 실행하고, 결과는 세션에 저장
+if run:
+    if not bike_key or not city_key:
+        st.error("API 키가 비어 있습니다. Streamlit Cloud의 Secrets에 API 키를 먼저 입력해 주세요.")
+        st.stop()
+
+    try:
+        with st.spinner("실시간 따릉이 API 호출 중..."):
+            bike_df = fetch_bike_api(bike_key)
+        with st.spinner("실시간 도시데이터 API 호출 중..."):
+            city_weather = fetch_city_weather(city_key, area_name)
+    except Exception as e:
+        st.error("API 호출 중 오류가 발생했어. API 키, 호출 제한, 장소명을 확인해줘.")
+        st.exception(e)
+        st.stop()
+
+    now = datetime.now(KST)
+    weather_class = classify_weather(
+        temp=to_float(city_weather["TEMP"], 0),
+        humidity=to_float(city_weather["HUMIDITY"], 0),
+        wind_spd=to_float(city_weather["WIND_SPD"], 0),
+        rain=to_float(city_weather["PRECIPITATION"], 0),
+        thresholds=thresholds,
+    )
+
+    candidates_all = make_realtime_candidates(
+        bike_df=bike_df,
+        data=data,
+        weather_cond=weather_class["기상조건"],
+        now=now,
+        L=L,
+        U=U,
+    )
+    context = candidates_all.attrs.get("context", {})
+
+    pickup_df = candidates_all[candidates_all["수거필요량"] > 0].sort_values("후보우선점수", ascending=False).head(pickup_n)
+    dropoff_df = candidates_all[candidates_all["재배치필요량"] > 0].sort_values("후보우선점수", ascending=False).head(dropoff_n)
+    selected = pd.concat([pickup_df, dropoff_df], ignore_index=True)
+
+    if selected.empty:
+        st.warning("현재 설정 기준에서는 수거·재배치 후보가 없습니다. 부족/과잉 기준 L, U를 조정해봐.")
+        st.session_state.route_bundle = None
+        st.stop()
+
+    routes, after_df = greedy_routes(selected, start_lat, start_lon, vehicle_count, capacity)
+
+    before_imbalance = int(selected["수거필요량"].sum() + selected["재배치필요량"].sum())
+    after_imbalance = int(after_df["처리후_남은수거"].sum() + after_df["처리후_남은재배치"].sum())
+    processed = before_imbalance - after_imbalance
+    improve = 0 if before_imbalance == 0 else processed / before_imbalance * 100
+
+    st.session_state.route_bundle = {
+        "now": now,
+        "city_weather": city_weather,
+        "weather_class": weather_class,
+        "context": context,
+        "pickup_df": pickup_df,
+        "dropoff_df": dropoff_df,
+        "selected": selected,
+        "routes": routes,
+        "after_df": after_df,
+        "before_imbalance": before_imbalance,
+        "after_imbalance": after_imbalance,
+        "processed": processed,
+        "improve": improve,
+        "start_lat": float(start_lat),
+        "start_lon": float(start_lon),
+    }
+
+# 아직 실행 결과가 없을 때 초기 화면 표시
+if st.session_state.route_bundle is None:
     st.info("왼쪽 사이드바 설정을 확인한 뒤 **실시간 경로 추천 실행** 버튼을 눌러줘.")
     st.subheader("📁 현재 포함된 경량 데이터")
     c1, c2, c3 = st.columns(3)
@@ -531,53 +619,24 @@ if not run:
     st.dataframe(data["station_filter"].head(20), use_container_width=True)
     st.stop()
 
-try:
-    with st.spinner("실시간 따릉이 API 호출 중..."):
-        bike_df = fetch_bike_api(bike_key)
-    with st.spinner("실시간 도시데이터 API 호출 중..."):
-        city_weather = fetch_city_weather(city_key, area_name)
-except Exception as e:
-    st.error("API 호출 중 오류가 발생했어. API 키, 호출 제한, 장소명을 확인해줘.")
-    st.exception(e)
-    st.stop()
+# 저장된 결과 표시. st_folium이나 위젯 rerun이 발생해도 결과가 유지됨
+bundle = st.session_state.route_bundle
+now = bundle["now"]
+city_weather = bundle["city_weather"]
+weather_class = bundle["weather_class"]
+context = bundle["context"]
+pickup_df = bundle["pickup_df"]
+dropoff_df = bundle["dropoff_df"]
+selected = bundle["selected"]
+routes = bundle["routes"]
+after_df = bundle["after_df"]
+before_imbalance = bundle["before_imbalance"]
+after_imbalance = bundle["after_imbalance"]
+processed = bundle["processed"]
+improve = bundle["improve"]
+start_lat = bundle["start_lat"]
+start_lon = bundle["start_lon"]
 
-now = datetime.now(KST)
-weather_class = classify_weather(
-    temp=to_float(city_weather["TEMP"], 0),
-    humidity=to_float(city_weather["HUMIDITY"], 0),
-    wind_spd=to_float(city_weather["WIND_SPD"], 0),
-    rain=to_float(city_weather["PRECIPITATION"], 0),
-    thresholds=thresholds,
-)
-
-candidates_all = make_realtime_candidates(
-    bike_df=bike_df,
-    data=data,
-    weather_cond=weather_class["기상조건"],
-    now=now,
-    L=L,
-    U=U,
-)
-context = candidates_all.attrs.get("context", {})
-
-pickup_df = candidates_all[candidates_all["수거필요량"] > 0].sort_values("후보우선점수", ascending=False).head(pickup_n)
-dropoff_df = candidates_all[candidates_all["재배치필요량"] > 0].sort_values("후보우선점수", ascending=False).head(dropoff_n)
-selected = pd.concat([pickup_df, dropoff_df], ignore_index=True)
-
-if selected.empty:
-    st.warning("현재 설정 기준에서는 수거·재배치 후보가 없습니다. 부족/과잉 기준 L, U를 조정해봐.")
-    st.stop()
-
-routes, after_df = greedy_routes(selected, start_lat, start_lon, vehicle_count, capacity)
-
-before_imbalance = int(selected["수거필요량"].sum() + selected["재배치필요량"].sum())
-after_imbalance = int(after_df["처리후_남은수거"].sum() + after_df["처리후_남은재배치"].sum())
-processed = before_imbalance - after_imbalance
-improve = 0 if before_imbalance == 0 else processed / before_imbalance * 100
-
-# -----------------------------
-# 결과 출력
-# -----------------------------
 st.subheader("① 현재 조건")
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("현재 시점", now.strftime("%m/%d %H:%M"))
@@ -595,7 +654,7 @@ w5.metric("날씨 업데이트", str(city_weather.get("WEATHER_TIME", "-")))
 
 st.subheader("② 수거·재배치 후보 및 개선 효과")
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("최적화 전 후보 불균형", f"{before_imbalance:,}대")
+m1.metric("처리 전 후보 불균형", f"{before_imbalance:,}대")
 m2.metric("휴리스틱 처리량", f"{processed:,}대")
 m3.metric("처리 후 남은 불균형", f"{after_imbalance:,}대")
 m4.metric("개선율", f"{improve:.1f}%")
@@ -624,7 +683,6 @@ st.subheader("⑤ 처리 후 남은 불균형")
 after_show = after_df[["대여소_ID", "대여소명", "수거필요량", "재배치필요량", "처리후_남은수거", "처리후_남은재배치"]]
 st.dataframe(after_show, use_container_width=True, hide_index=True)
 
-# 선택적 다운로드. 화면 표시가 핵심이고, 파일 저장은 보조 기능.
 with st.expander("결과 파일로 저장, 선택사항", expanded=False):
     csv_buf = io.StringIO()
     routes.to_csv(csv_buf, index=False, encoding="utf-8-sig")
