@@ -3,6 +3,7 @@
 여의도 따릉이 수거·재배치 경로 추천 대시보드, 배포용 경량 버전
 - Gurobi 미사용
 - 실시간 API + 과거 수요모델 + Greedy 휴리스틱 경로 추천
+- OSRM 도로망 경로 + 방향 화살표 + 차량별 개별 지도
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import folium
+from folium.plugins import PolyLineTextPath
 import numpy as np
 import pandas as pd
 import requests
@@ -412,14 +414,137 @@ def greedy_routes(candidates: pd.DataFrame, start_lat: float, start_lon: float, 
     return route_df, work
 
 
-def build_map(candidates: pd.DataFrame, routes: pd.DataFrame, start_lat: float, start_lon: float):
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def fetch_osrm_route(lat1: float, lon1: float, lat2: float, lon2: float):
+    """
+    OSRM 공개 서버를 이용해 자동차 도로망 기준 경로를 가져온다.
+    실패하면 직선 경로로 fallback한다.
+    반환: (points[[lat, lon], ...], distance_m, is_osrm)
+    """
+    try:
+        url = (
+            "https://router.project-osrm.org/route/v1/driving/"
+            f"{lon1},{lat1};{lon2},{lat2}"
+            "?overview=full&geometries=geojson&steps=false&alternatives=false"
+        )
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        js = r.json()
+        if js.get("code") != "Ok" or not js.get("routes"):
+            raise ValueError(js.get("message", "OSRM route not found"))
+        route = js["routes"][0]
+        coords = route["geometry"]["coordinates"]
+        points = [[float(lat), float(lon)] for lon, lat in coords]
+        distance = float(route.get("distance", haversine_m(lat1, lon1, lat2, lon2)))
+        if len(points) < 2:
+            points = [[lat1, lon1], [lat2, lon2]]
+        return points, distance, True
+    except Exception:
+        return [[lat1, lon1], [lat2, lon2]], haversine_m(lat1, lon1, lat2, lon2), False
+
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """북쪽 기준 시계방향 bearing degree."""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    y = math.sin(dlambda) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def point_and_bearing_at_fraction(points: list[list[float]], frac: float):
+    """폴리라인 길이의 frac 지점 좌표와 해당 구간 방향을 계산."""
+    if len(points) < 2:
+        return points[0], 0
+    seg_lens = []
+    total = 0.0
+    for a, b in zip(points[:-1], points[1:]):
+        d = haversine_m(a[0], a[1], b[0], b[1])
+        seg_lens.append(d)
+        total += d
+    if total <= 0:
+        a, b = points[0], points[-1]
+        return a, bearing_deg(a[0], a[1], b[0], b[1])
+    target = total * frac
+    acc = 0.0
+    for idx, d in enumerate(seg_lens):
+        a = points[idx]
+        b = points[idx + 1]
+        if acc + d >= target:
+            local = 0 if d == 0 else (target - acc) / d
+            lat = a[0] + (b[0] - a[0]) * local
+            lon = a[1] + (b[1] - a[1]) * local
+            return [lat, lon], bearing_deg(a[0], a[1], b[0], b[1])
+        acc += d
+    a, b = points[-2], points[-1]
+    return points[-1], bearing_deg(a[0], a[1], b[0], b[1])
+
+
+def add_direction_arrows(m: folium.Map, points: list[list[float]], color: str):
+    """노드와 노드 사이 도로 경로 위에 방향 화살표 3개 표시."""
+    if len(points) < 2:
+        return
+    for frac in [0.25, 0.50, 0.75]:
+        pt, brg = point_and_bearing_at_fraction(points, frac)
+        # CSS 기본 화살표(➤)는 동쪽을 향하므로 bearing 보정
+        rot = brg - 90
+        html = f"""
+        <div style="
+            transform: rotate({rot:.1f}deg);
+            color: {color};
+            font-size: 20px;
+            font-weight: 900;
+            text-shadow: 0 0 3px white, 0 0 5px white;
+            line-height: 20px;
+        ">➤</div>
+        """
+        folium.Marker(
+            location=pt,
+            icon=folium.DivIcon(html=html, icon_size=(20, 20), icon_anchor=(10, 10)),
+            interactive=False,
+        ).add_to(m)
+
+
+def add_route_segment(m: folium.Map, start_pt, end_pt, color: str, tooltip: str):
+    """OSRM 도로망 경로를 그리고 화살표를 추가한다."""
+    pts, dist_m, is_osrm = fetch_osrm_route(start_pt[0], start_pt[1], end_pt[0], end_pt[1])
+    line = folium.PolyLine(
+        pts,
+        color=color,
+        weight=5,
+        opacity=0.85,
+        tooltip=f"{tooltip} · {dist_m/1000:.2f} km" + ("" if is_osrm else " · 직선 fallback"),
+    )
+    line.add_to(m)
+    # 경로 위 방향 화살표. PolyLineTextPath도 함께 사용해 방향성이 보이도록 함.
+    add_direction_arrows(m, pts, color)
+    try:
+        PolyLineTextPath(
+            line,
+            "   ▶   ",
+            repeat=True,
+            offset=8,
+            attributes={"fill": color, "font-weight": "bold", "font-size": "12"},
+        ).add_to(m)
+    except Exception:
+        pass
+    return dist_m, is_osrm
+
+
+def build_candidate_overview_map(candidates: pd.DataFrame, start_lat: float, start_lon: float):
+    """경로선 없이 후보 대여소만 보여주는 개요 지도."""
     center = [start_lat, start_lon]
     if not candidates.empty:
         center = [float(candidates["위도"].mean()), float(candidates["경도"].mean())]
     m = folium.Map(location=center, zoom_start=14, tiles="CartoDB positron")
-    folium.Marker([start_lat, start_lon], popup="출발지", tooltip="출발지", icon=folium.Icon(color="black", icon="home")).add_to(m)
-
-    # 후보 마커
+    folium.Marker(
+        [start_lat, start_lon],
+        popup="출발지",
+        tooltip="출발지",
+        icon=folium.Icon(color="black", icon="home"),
+    ).add_to(m)
     for _, r in candidates.iterrows():
         if r["수거필요량"] > 0:
             color, label = "red", f"수거 {int(r['수거필요량'])}대"
@@ -435,23 +560,86 @@ def build_map(candidates: pd.DataFrame, routes: pd.DataFrame, start_lat: float, 
         {label}
         """
         folium.CircleMarker(
-            [r["위도"], r["경도"]], radius=7, color=color, fill=True, fill_opacity=0.75,
-            popup=folium.Popup(html, max_width=320), tooltip=f"{r['대여소명']} · {label}"
+            [r["위도"], r["경도"]],
+            radius=8,
+            color=color,
+            fill=True,
+            fill_opacity=0.78,
+            popup=folium.Popup(html, max_width=320),
+            tooltip=f"{r['대여소명']} · {label}",
+        ).add_to(m)
+    return m
+
+
+def build_vehicle_route_map(candidates: pd.DataFrame, routes: pd.DataFrame, vehicle_id: int, start_lat: float, start_lon: float):
+    """차량 하나의 도로망 경로만 보여주는 지도."""
+    grp = routes[routes["vehicle"] == vehicle_id].sort_values("order").copy()
+    center = [start_lat, start_lon]
+    if not grp.empty:
+        center = [float(grp["lat"].mean()), float(grp["lon"].mean())]
+
+    m = folium.Map(location=center, zoom_start=14, tiles="CartoDB positron")
+    folium.Marker(
+        [start_lat, start_lon],
+        popup="출발지",
+        tooltip="출발지",
+        icon=folium.Icon(color="black", icon="home"),
+    ).add_to(m)
+
+    if grp.empty:
+        return m, 0.0, 0
+
+    color_palette = ["green", "purple", "orange", "darkred", "cadetblue", "darkgreen"]
+    color = color_palette[(vehicle_id - 1) % len(color_palette)]
+
+    # 방문 지점 마커
+    for _, s in grp.iterrows():
+        action_color = "red" if s["action"] == "수거" else "blue"
+        html = f"""
+        <b>차량 {int(s['vehicle'])} - {int(s['order'])}번째 방문</b><br>
+        {s['station_name']}<br>
+        작업: {s['action']} {int(s['qty'])}대<br>
+        작업 후 적재량: {int(s['load_after'])}대
+        """
+        folium.Marker(
+            [s["lat"], s["lon"]],
+            tooltip=f"{int(s['order'])}. {s['station_name']} · {s['action']} {int(s['qty'])}대",
+            popup=folium.Popup(html, max_width=320),
+            icon=folium.Icon(color=action_color, icon="info-sign"),
+        ).add_to(m)
+        folium.Marker(
+            [s["lat"], s["lon"]],
+            icon=folium.DivIcon(
+                html=f"<div style='font-size:13px;background:white;border:2px solid {action_color};border-radius:12px;padding:2px 6px;font-weight:bold'>{int(s['order'])}</div>",
+                icon_size=(30, 24),
+                icon_anchor=(15, 12),
+            ),
+            interactive=False,
         ).add_to(m)
 
-    # 차량별 경로선
-    colors = ["green", "purple", "orange", "darkred", "cadetblue", "darkgreen"]
-    if not routes.empty:
-        for i, (veh, grp) in enumerate(routes.groupby("vehicle")):
-            pts = [[start_lat, start_lon]] + grp.sort_values("order")[["lat", "lon"]].values.tolist()
-            folium.PolyLine(pts, color=colors[i % len(colors)], weight=4, opacity=0.8, tooltip=f"차량 {veh} 경로").add_to(m)
-            for _, s in grp.iterrows():
-                folium.Marker(
-                    [s["lat"], s["lon"]],
-                    tooltip=f"차량 {s['vehicle']} - {s['order']}. {s['action']} {s['qty']}대",
-                    icon=folium.DivIcon(html=f"<div style='font-size:12px;background:white;border:1px solid #444;border-radius:10px;padding:2px'>{int(s['vehicle'])}-{int(s['order'])}</div>")
-                ).add_to(m)
-    return m
+    # 출발지 -> 각 방문지 도로망 경로
+    route_points = [[start_lat, start_lon]] + grp[["lat", "lon"]].values.tolist()
+    total_dist = 0.0
+    fallback_count = 0
+    for idx in range(len(route_points) - 1):
+        a = route_points[idx]
+        b = route_points[idx + 1]
+        dist_m, is_osrm = add_route_segment(
+            m,
+            a,
+            b,
+            color=color,
+            tooltip=f"차량 {vehicle_id} {idx}→{idx+1} 구간",
+        )
+        total_dist += dist_m
+        fallback_count += 0 if is_osrm else 1
+
+    # 지도 bounds 맞추기
+    try:
+        m.fit_bounds(route_points, padding=(30, 30))
+    except Exception:
+        pass
+    return m, total_dist, fallback_count
 
 
 # -----------------------------
@@ -669,17 +857,47 @@ with right:
     show_cols = ["대여소_ID", "대여소명", "현재자전거수", "거치대수", "예상재고", "재배치필요량", "후보우선점수"]
     st.dataframe(dropoff_df[show_cols], use_container_width=True, hide_index=True)
 
-st.subheader("③ 차량별 추천 경로 지도")
-route_map = build_map(selected, routes, start_lat, start_lon)
-st_folium(route_map, width=None, height=620)
+st.subheader("③ 후보 대여소 개요 지도")
+st.caption("아래 지도는 수거·재배치 후보 위치만 보여줍니다. 차량 경로는 차량별 개별 지도에서 따로 확인합니다.")
+overview_map = build_candidate_overview_map(selected, start_lat, start_lon)
+st_folium(overview_map, width=None, height=520, key="overview_map")
 
-st.subheader("④ 차량별 방문 순서")
+st.subheader("④ 차량별 도로망 경로 지도")
+st.caption("각 차량을 별도 탭으로 분리했습니다. 초록/보라/주황 경로선은 OSRM 도로망 기준이며, 화살표는 차량 진행 방향을 의미합니다.")
+if routes.empty:
+    st.warning("경로가 생성되지 않았습니다. 후보 수나 L/U 기준을 조정해봐.")
+else:
+    vehicles = sorted(routes["vehicle"].unique().tolist())
+    tabs = st.tabs([f"차량 {int(v)}" for v in vehicles])
+    total_dist_rows = []
+    html_maps = {}
+    for tab, veh in zip(tabs, vehicles):
+        with tab:
+            veh_map, total_dist, fallback_count = build_vehicle_route_map(selected, routes, int(veh), start_lat, start_lon)
+            html_maps[int(veh)] = veh_map.get_root().render()
+            c_a, c_b, c_c = st.columns(3)
+            c_a.metric("방문 지점 수", f"{len(routes[routes['vehicle'] == veh]):,}곳")
+            c_b.metric("도로망 이동거리", f"{total_dist/1000:.2f} km")
+            c_c.metric("OSRM 실패 구간", f"{fallback_count}개")
+            st_folium(veh_map, width=None, height=620, key=f"vehicle_map_{int(veh)}")
+            st.markdown("##### 차량별 방문 순서")
+            st.dataframe(
+                routes[routes["vehicle"] == veh][["vehicle", "order", "station_name", "action", "qty", "load_after"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+            total_dist_rows.append({"차량": int(veh), "도로망 이동거리(km)": round(total_dist / 1000, 3), "OSRM실패구간": fallback_count})
+
+    st.markdown("##### 차량별 이동거리 요약")
+    st.dataframe(pd.DataFrame(total_dist_rows), use_container_width=True, hide_index=True)
+
+st.subheader("⑤ 전체 차량 방문 순서")
 if routes.empty:
     st.warning("경로가 생성되지 않았습니다. 후보 수나 L/U 기준을 조정해봐.")
 else:
     st.dataframe(routes, use_container_width=True, hide_index=True)
 
-st.subheader("⑤ 처리 후 남은 불균형")
+st.subheader("⑥ 처리 후 남은 불균형")
 after_show = after_df[["대여소_ID", "대여소명", "수거필요량", "재배치필요량", "처리후_남은수거", "처리후_남은재배치"]]
 st.dataframe(after_show, use_container_width=True, hide_index=True)
 
@@ -688,5 +906,8 @@ with st.expander("결과 파일로 저장, 선택사항", expanded=False):
     routes.to_csv(csv_buf, index=False, encoding="utf-8-sig")
     st.download_button("차량 경로 CSV 다운로드", csv_buf.getvalue().encode("utf-8-sig"), "route_result.csv", "text/csv")
 
-    html = route_map.get_root().render()
-    st.download_button("지도 HTML 다운로드", html.encode("utf-8"), "route_map.html", "text/html")
+    overview_html = overview_map.get_root().render()
+    st.download_button("후보 개요 지도 HTML 다운로드", overview_html.encode("utf-8"), "candidate_overview_map.html", "text/html")
+    if not routes.empty:
+        for veh, html in html_maps.items():
+            st.download_button(f"차량 {veh} 경로 지도 HTML 다운로드", html.encode("utf-8"), f"vehicle_{veh}_route_map.html", "text/html")
