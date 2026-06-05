@@ -1,913 +1,1125 @@
 # -*- coding: utf-8 -*-
 """
-여의도 따릉이 수거·재배치 경로 추천 대시보드, 배포용 경량 버전
-- Gurobi 미사용
-- 실시간 API + 과거 수요모델 + Greedy 휴리스틱 경로 추천
-- OSRM 도로망 경로 + 방향 화살표 + 차량별 개별 지도
+배포용 Streamlit 대시보드 app.py
+- API 키 입력창 없음: Streamlit Cloud Secrets에서만 로드
+- 차량별 경로 지도 분리: 차량 1 / 차량 2 / ... 탭으로 표시
+- 직선 연결이 아니라 OSRM 도로 경로 사용, 실패 시 해당 구간만 직선 fallback
+- 경로 방향 화살표: 각 구간에 2개씩 표시
+- 결과가 사라지지 않도록 st.session_state 사용
+- 계산 기준/과정 설명 섹션 포함
 """
 
 from __future__ import annotations
 
-import io
 import math
 import re
-import urllib.parse
-from dataclasses import dataclass
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
 
-import folium
-from folium.plugins import PolyLineTextPath
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import folium
 from streamlit_folium import st_folium
 
-# -----------------------------
-# 기본 설정
-# -----------------------------
+
+# ============================================================
+# 0. 기본 설정
+# ============================================================
+
 st.set_page_config(
     page_title="여의도 따릉이 수거·재배치 대시보드",
     page_icon="🚲",
     layout="wide",
 )
 
-DATA_DIR = "data"
-KST = ZoneInfo("Asia/Seoul")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
 
-# -----------------------------
-# 유틸 함수
-# -----------------------------
-def get_secret_or_empty(key: str) -> str:
-    try:
-        return str(st.secrets.get(key, ""))
-    except Exception:
-        return ""
+# 배포용 CSV 파일명
+FILE_BASE_DEMAND = DATA_DIR / "기본예상수요.csv"
+FILE_WEATHER_THRESHOLD = DATA_DIR / "날씨구간화기준.csv"
+FILE_WEATHER_COEF = DATA_DIR / "통합기상조건보정계수.csv"
+FILE_STATION_PRIORITY = DATA_DIR / "대여소우선순위.csv"
+FILE_YEOUIDO_FILTER = DATA_DIR / "여의도_대여소_필터.csv"
+FILE_AREA_LIST = DATA_DIR / "서울시_주요_121장소_목록.csv"
 
+BIKE_API_BASE = "http://openapi.seoul.go.kr:8088/{key}/json/bikeList/{start}/{end}/"
+CITYDATA_API_BASE = "http://openapi.seoul.go.kr:8088/{key}/json/citydata/1/5/{area_nm}"
+OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
 
-def to_float(x, default=np.nan):
-    try:
-        if x is None:
-            return default
-        if isinstance(x, str):
-            x = x.strip().replace(",", "")
-            if x in ["", "-", "점검중"]:
-                return default
-            # 서울 도시데이터 강수량은 "강수없음" 등이 섞일 수 있음
-            if "없" in x:
-                return 0.0
-            m = re.search(r"-?\d+(?:\.\d+)?", x)
-            if m:
-                return float(m.group(0))
-            return default
-        return float(x)
-    except Exception:
-        return default
+DEFAULT_CENTER = [37.5269, 126.9245]  # 여의도 인근
 
 
-def haversine_m(lat1, lon1, lat2, lon2) -> float:
-    """위경도 직선거리, meter."""
-    R = 6371000
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+# ============================================================
+# 1. CSS: 글씨 잘림 방지 / 카드 크기 축소
+# ============================================================
 
-
-def season_from_month(m: int) -> str:
-    if m in [3, 4, 5]:
-        return "봄"
-    if m in [6, 7, 8]:
-        return "여름"
-    if m in [9, 10, 11]:
-        return "가을"
-    return "겨울"
-
-
-def time_group_from_hour(h: int) -> str:
-    # 기존 분석 코드의 시간대그룹과 맞추기 위한 일반적 구분
-    if 0 <= h <= 5:
-        return "심야"
-    if 6 <= h <= 9:
-        return "출근시간"
-    if 10 <= h <= 16:
-        return "낮시간"
-    if 17 <= h <= 20:
-        return "퇴근시간"
-    return "야간"
-
-
-def weektype_from_date(dt: datetime) -> str:
-    return "주말" if dt.weekday() >= 5 else "평일"
-
-
-@st.cache_data
-def load_csv_data():
-    data = {
-        "thresholds": pd.read_csv(f"{DATA_DIR}/날씨구간화기준.csv"),
-        "base": pd.read_csv(f"{DATA_DIR}/기본예상수요.csv"),
-        "weather_coef": pd.read_csv(f"{DATA_DIR}/통합기상조건보정계수.csv"),
-        "priority": pd.read_csv(f"{DATA_DIR}/대여소우선순위.csv"),
-        "time_priority": pd.read_csv(f"{DATA_DIR}/시간대별우선순위.csv"),
-        "station_filter": pd.read_csv(f"{DATA_DIR}/여의도_대여소_필터.csv"),
-        "places": pd.read_csv(f"{DATA_DIR}/서울시_주요_121장소_목록.csv"),
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 1.2rem;
+        padding-bottom: 2rem;
+        max-width: 1500px;
     }
-    # ID는 문자열로 통일
-    for key in ["base", "priority", "time_priority", "station_filter"]:
-        if "대여소_ID" in data[key].columns:
-            data[key]["대여소_ID"] = data[key]["대여소_ID"].astype(str).str.strip()
-    return data
+    h1 { font-size: 2.0rem !important; }
+    h2 { font-size: 1.45rem !important; margin-top: 1.2rem !important; }
+    h3 { font-size: 1.15rem !important; }
+
+    .small-note {
+        font-size: 0.88rem;
+        color: #5f6673;
+        line-height: 1.45;
+    }
+    .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 0.65rem;
+        margin: 0.7rem 0 1.0rem 0;
+    }
+    .metric-card {
+        border: 1px solid #e7eaf0;
+        border-radius: 14px;
+        padding: 0.75rem 0.85rem;
+        background: #ffffff;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+        min-height: 78px;
+    }
+    .metric-label {
+        font-size: 0.78rem;
+        color: #667085;
+        margin-bottom: 0.35rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .metric-value {
+        font-size: 1.35rem;
+        font-weight: 700;
+        color: #252b37;
+        line-height: 1.2;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .section-box {
+        border: 1px solid #e7eaf0;
+        border-radius: 14px;
+        padding: 1rem 1.1rem;
+        background: #fbfcff;
+        margin: 0.75rem 0 1rem 0;
+    }
+    .route-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        margin: 0.5rem 0 0.25rem 0;
+    }
+    .warn-box {
+        border: 1px solid #ffd6a7;
+        background: #fff8ef;
+        color: #7a4b00;
+        padding: 0.75rem 1rem;
+        border-radius: 12px;
+        margin: 0.8rem 0;
+        font-size: 0.9rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-def parse_thresholds(th_df: pd.DataFrame) -> dict:
-    """날씨구간화기준.csv의 기준 문장을 숫자 기준으로 변환."""
-    out = {}
-    for _, row in th_df.iterrows():
-        var = str(row.get("변수", ""))
-        text = str(row.get("구간화 기준", ""))
-        nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", text)]
-        if var in ["기온", "습도", "풍속"] and len(nums) >= 2:
-            out[var] = (nums[0], nums[1])
-        elif var == "강수량" and len(nums) >= 1:
-            # 0과 중앙값이 같이 잡히므로 마지막 숫자를 중앙값으로 사용
-            out[var] = nums[-1]
+# ============================================================
+# 2. 공통 유틸
+# ============================================================
+
+def norm_station_id(x: Any) -> str:
+    """stationId가 ST-123 / 123 / 123.0 등으로 섞여도 매칭되도록 정규화."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    m = re.search(r"(\d+)", s)
+    return m.group(1) if m else s
+
+
+def to_float(x: Any, default: float = 0.0) -> float:
+    if x is None or pd.isna(x):
+        return default
+    s = str(x).strip()
+    if s in ["", "-", "None", "nan"]:
+        return default
+    s = s.replace("%", "").replace("mm", "").replace("㎜", "").replace("m/s", "")
+    try:
+        return float(s)
+    except Exception:
+        nums = re.findall(r"-?\d+\.?\d*", s)
+        return float(nums[0]) if nums else default
+
+
+def find_col(df: pd.DataFrame, candidates: List[str], required: bool = True) -> Optional[str]:
+    cols = {str(c).strip(): c for c in df.columns}
+    for c in candidates:
+        if c in cols:
+            return cols[c]
+    # contains match fallback
+    for cand in candidates:
+        for c in df.columns:
+            if cand.replace(" ", "") in str(c).replace(" ", ""):
+                return c
+    if required:
+        raise KeyError(f"필수 컬럼을 찾을 수 없습니다: {candidates} / 현재 컬럼: {list(df.columns)}")
+    return None
+
+
+def current_time_context(now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = now or datetime.now()
+    hour = now.hour
+
+    # 기존 분석 코드의 시간대그룹 명칭과 최대한 맞춤
+    if 0 <= hour < 6:
+        tg = "심야"
+    elif 6 <= hour < 10:
+        tg = "출근시간"
+    elif 10 <= hour < 17:
+        tg = "낮시간"
+    elif 17 <= hour < 21:
+        tg = "퇴근시간"
+    else:
+        tg = "야간"
+
+    weektype = "주말" if now.weekday() >= 5 else "평일"
+    month = now.month
+    if month in [3, 4, 5]:
+        season = "봄"
+    elif month in [6, 7, 8]:
+        season = "여름"
+    elif month in [9, 10, 11]:
+        season = "가을"
+    else:
+        season = "겨울"
+
+    return {
+        "now": now,
+        "시간대": hour,
+        "시간대그룹": tg,
+        "평일주말": weektype,
+        "월": month,
+        "계절": season,
+    }
+
+
+def metric_grid(items: List[Tuple[str, str]]) -> None:
+    html = ['<div class="metric-grid">']
+    for label, value in items:
+        html.append(
+            f'<div class="metric-card"><div class="metric-label" title="{label}">{label}</div>'
+            f'<div class="metric-value" title="{value}">{value}</div></div>'
+        )
+    html.append('</div>')
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+# ============================================================
+# 3. 데이터 로드
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def read_csv_safely(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    for enc in ["utf-8-sig", "utf-8", "cp949", "euc-kr"]:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception:
+            continue
+    return pd.read_csv(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_static_data() -> Dict[str, pd.DataFrame]:
+    return {
+        "base": read_csv_safely(FILE_BASE_DEMAND),
+        "threshold": read_csv_safely(FILE_WEATHER_THRESHOLD),
+        "coef": read_csv_safely(FILE_WEATHER_COEF),
+        "priority": read_csv_safely(FILE_STATION_PRIORITY),
+        "filter": read_csv_safely(FILE_YEOUIDO_FILTER),
+        "areas": read_csv_safely(FILE_AREA_LIST),
+    }
+
+
+# ============================================================
+# 4. API 호출
+# ============================================================
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_bike_api(api_key: str, max_rows: int = 3000) -> pd.DataFrame:
+    if not api_key:
+        return pd.DataFrame()
+
+    rows = []
+    step = 1000
+    for start in range(1, max_rows + 1, step):
+        end = min(start + step - 1, max_rows)
+        url = BIKE_API_BASE.format(key=api_key, start=start, end=end)
+        try:
+            r = requests.get(url, timeout=12)
+            r.raise_for_status()
+            data = r.json()
+            part = data.get("rentBikeStatus", {}).get("row", [])
+            if not part:
+                break
+            rows.extend(part)
+            total = int(data.get("rentBikeStatus", {}).get("list_total_count", len(rows)))
+            if end >= total:
+                break
+        except Exception as e:
+            st.warning(f"따릉이 API 호출 실패: {e}")
+            break
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    rename_map = {
+        "stationId": "대여소_ID_API",
+        "stationName": "대여소명_API",
+        "parkingBikeTotCnt": "현재자전거수",
+        "rackTotCnt": "거치대수",
+        "shared": "거치율",
+        "stationLatitude": "위도",
+        "stationLongitude": "경도",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    for c in ["현재자전거수", "거치대수", "거치율", "위도", "경도"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if "대여소_ID_API" in df.columns:
+        df["station_key"] = df["대여소_ID_API"].apply(norm_station_id)
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_citydata_api(api_key: str, area_nm: str) -> Dict[str, Any]:
+    if not api_key or not area_nm:
+        return {}
+    url = CITYDATA_API_BASE.format(key=api_key, area_nm=requests.utils.quote(area_nm))
+    try:
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        root = data.get("CITYDATA") or data.get("SeoulRtd.citydata") or data
+        if isinstance(root, dict):
+            return root
+        return {}
+    except Exception as e:
+        st.warning(f"도시데이터 API 호출 실패: {e}")
+        return {}
+
+
+def parse_weather(citydata: Dict[str, Any]) -> Dict[str, Any]:
+    weather = citydata.get("WEATHER_STTS", {}) if isinstance(citydata, dict) else {}
+    if isinstance(weather, list) and weather:
+        weather = weather[0]
+    if not isinstance(weather, dict):
+        weather = {}
+
+    return {
+        "TEMP": to_float(weather.get("TEMP"), np.nan),
+        "HUMIDITY": to_float(weather.get("HUMIDITY"), np.nan),
+        "WIND_SPD": to_float(weather.get("WIND_SPD"), np.nan),
+        "PRECIPITATION": to_float(weather.get("PRECIPITATION"), 0.0),
+        "PRECPT_TYPE": str(weather.get("PRECPT_TYPE", "")),
+        "WEATHER_TIME": str(weather.get("WEATHER_TIME", "")),
+    }
+
+
+# ============================================================
+# 5. 실시간 조건 구간화
+# ============================================================
+
+def parse_threshold_value(text: str, key: str) -> Optional[float]:
+    """날씨구간화기준.csv의 문장형 기준에서 숫자 추출."""
+    if not isinstance(text, str):
+        return None
+    nums = re.findall(r"-?\d+\.\d+|-?\d+", text)
+    if not nums:
+        return None
+    # 기준 문자열은 대개 q1, q2 순서. 필요한 key에 따라 처리
+    vals = [float(x) for x in nums]
+    if key == "q1":
+        return vals[0]
+    if key == "q2":
+        return vals[1] if len(vals) > 1 else vals[0]
+    if key == "median":
+        # 강수량은 보통 0과 중앙값이 같이 있으므로 마지막 숫자를 중앙값으로 사용
+        return vals[-1]
+    return vals[0]
+
+
+def get_weather_thresholds(threshold_df: pd.DataFrame) -> Dict[str, float]:
+    out = {
+        "temp_q1": 10.0,
+        "temp_q2": 25.0,
+        "humid_q1": 40.0,
+        "humid_q2": 70.0,
+        "wind_q1": 2.0,
+        "wind_q2": 5.0,
+        "rain_median": 5.0,
+    }
+    if threshold_df.empty:
+        return out
+
+    var_col = find_col(threshold_df, ["변수"], required=False)
+    crit_col = find_col(threshold_df, ["구간화 기준", "기준"], required=False)
+    if var_col is None or crit_col is None:
+        return out
+
+    for _, row in threshold_df.iterrows():
+        var = str(row.get(var_col, ""))
+        crit = str(row.get(crit_col, ""))
+        if "기온" in var:
+            out["temp_q1"] = parse_threshold_value(crit, "q1") or out["temp_q1"]
+            out["temp_q2"] = parse_threshold_value(crit, "q2") or out["temp_q2"]
+        elif "습도" in var:
+            out["humid_q1"] = parse_threshold_value(crit, "q1") or out["humid_q1"]
+            out["humid_q2"] = parse_threshold_value(crit, "q2") or out["humid_q2"]
+        elif "풍속" in var:
+            out["wind_q1"] = parse_threshold_value(crit, "q1") or out["wind_q1"]
+            out["wind_q2"] = parse_threshold_value(crit, "q2") or out["wind_q2"]
+        elif "강수" in var:
+            out["rain_median"] = parse_threshold_value(crit, "median") or out["rain_median"]
     return out
 
 
-def classify_weather(temp, humidity, wind_spd, rain, thresholds: dict) -> dict:
-    tq1, tq2 = thresholds.get("기온", (5, 25))
-    hq1, hq2 = thresholds.get("습도", (40, 70))
-    wq1, wq2 = thresholds.get("풍속", (2, 5))
-    rq = thresholds.get("강수량", 0.5)
+def classify_weather(weather: Dict[str, Any], thresholds: Dict[str, float]) -> Dict[str, str]:
+    temp = weather.get("TEMP", np.nan)
+    humid = weather.get("HUMIDITY", np.nan)
+    wind = weather.get("WIND_SPD", np.nan)
+    rain = weather.get("PRECIPITATION", 0.0)
 
-    temp_cond = "저온" if temp <= tq1 else ("적정" if temp <= tq2 else "고온")
-    humid_cond = "낮음" if humidity <= hq1 else ("보통" if humidity <= hq2 else "높음")
-    wind_cond = "약풍" if wind_spd <= wq1 else ("보통" if wind_spd <= wq2 else "강풍")
-    rain_cond = "비없음" if rain <= 0 else ("약한비" if rain <= rq else "강한비")
-    snow_cond = "눈없음"  # 도시데이터 실시간 API에는 적설량이 명확히 없으므로 기본값 처리
-    weather_cond = f"{temp_cond}_{rain_cond}_{humid_cond}_{wind_cond}_{snow_cond}"
+    def tri(x, q1, q2, labels):
+        if pd.isna(x):
+            return labels[1]
+        if x <= q1:
+            return labels[0]
+        elif x <= q2:
+            return labels[1]
+        return labels[2]
+
+    temp_cond = tri(temp, thresholds["temp_q1"], thresholds["temp_q2"], ["저온", "적정", "고온"])
+    humid_cond = tri(humid, thresholds["humid_q1"], thresholds["humid_q2"], ["낮음", "보통", "높음"])
+    wind_cond = tri(wind, thresholds["wind_q1"], thresholds["wind_q2"], ["약풍", "보통", "강풍"])
+
+    if rain <= 0:
+        rain_cond = "비없음"
+    elif rain <= thresholds["rain_median"]:
+        rain_cond = "약한비"
+    else:
+        rain_cond = "강한비"
+
+    snow_cond = "눈없음"  # 도시데이터 API에서 적설값이 없으므로 배포용은 눈없음 처리
+    full = f"{temp_cond}_{rain_cond}_{humid_cond}_{wind_cond}_{snow_cond}"
+
     return {
         "기온조건": temp_cond,
         "강수조건": rain_cond,
         "습도조건": humid_cond,
         "풍속조건": wind_cond,
         "적설조건": snow_cond,
-        "기상조건": weather_cond,
+        "기상조건": full,
     }
 
 
-# -----------------------------
-# API 호출
-# -----------------------------
-@st.cache_data(ttl=60)
-def fetch_bike_api(api_key: str) -> pd.DataFrame:
-    if not api_key:
-        raise ValueError("따릉이 API 키가 비어 있습니다.")
+# ============================================================
+# 6. 후보 계산
+# ============================================================
 
-    rows = []
-    # 서울 전체 대여소는 보통 1~3000 범위 내에 있음
-    for start, end in [(1, 1000), (1001, 2000), (2001, 3000)]:
-        url = f"http://openapi.seoul.go.kr:8088/{api_key}/json/bikeList/{start}/{end}/"
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        js = r.json()
-        if "rentBikeStatus" not in js:
-            continue
-        rows.extend(js["rentBikeStatus"].get("row", []))
+def filter_yeouido_stations(bike_df: pd.DataFrame, filter_df: pd.DataFrame) -> pd.DataFrame:
+    if bike_df.empty:
+        return bike_df
 
-    if not rows:
-        raise ValueError("따릉이 API에서 대여소 데이터를 가져오지 못했습니다.")
+    df = bike_df.copy()
+    if not filter_df.empty:
+        sid_col = find_col(filter_df, ["대여소_ID", "대여소ID", "stationId", "SBIKE_SPOT_ID"], required=False)
+        if sid_col:
+            keys = set(filter_df[sid_col].apply(norm_station_id).astype(str))
+            if keys:
+                out = df[df["station_key"].astype(str).isin(keys)].copy()
+                if not out.empty:
+                    return out
 
-    df = pd.DataFrame(rows)
-    rename = {
-        "stationId": "대여소_ID",
-        "stationName": "대여소명_API",
-        "parkingBikeTotCnt": "현재자전거수",
-        "rackTotCnt": "거치대수",
-        "shared": "현재거치율",
-        "stationLatitude": "위도",
-        "stationLongitude": "경도",
-    }
-    df = df.rename(columns=rename)
-    keep = [c for c in rename.values() if c in df.columns]
-    df = df[keep].copy()
-    df["대여소_ID"] = df["대여소_ID"].astype(str).str.strip()
-    for c in ["현재자전거수", "거치대수", "현재거치율", "위도", "경도"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # fallback: 이름 키워드 필터
+    name_col = "대여소명_API" if "대여소명_API" in df.columns else None
+    if name_col:
+        keywords = ["여의", "국회", "샛강", "IFC", "더현대", "한강", "파크원", "KBS"]
+        pat = "|".join(keywords)
+        out = df[df[name_col].astype(str).str.contains(pat, case=False, na=False)].copy()
+        return out if not out.empty else df
     return df
 
 
-def find_key_recursive(obj, target_key):
-    """중첩 dict/list에서 첫 번째 target_key 값 탐색."""
-    if isinstance(obj, dict):
-        if target_key in obj:
-            return obj[target_key]
-        for v in obj.values():
-            res = find_key_recursive(v, target_key)
-            if res is not None:
-                return res
-    elif isinstance(obj, list):
-        for it in obj:
-            res = find_key_recursive(it, target_key)
-            if res is not None:
-                return res
-    return None
+def prepare_base_for_current(base_df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.DataFrame:
+    if base_df.empty:
+        return pd.DataFrame()
+    df = base_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    sid_col = find_col(df, ["대여소_ID", "대여소ID"], required=False)
+    if sid_col:
+        df["station_key"] = df[sid_col].apply(norm_station_id)
+
+    # 현재 조건과 일치하는 행 우선. 없으면 조건을 점차 완화.
+    conds = []
+    for colname, val in [("시간대그룹", ctx["시간대그룹"]), ("평일주말", ctx["평일주말"]), ("월", ctx["월"]), ("계절", ctx["계절"]), ("시간대", ctx["시간대"] )]:
+        if colname in df.columns:
+            conds.append((colname, val))
+
+    cur = df.copy()
+    for col, val in conds:
+        tmp = cur[cur[col].astype(str) == str(val)].copy()
+        if not tmp.empty:
+            cur = tmp
+
+    # 여전히 같은 대여소 여러 행이면 평균
+    demand_out_col = find_col(cur, ["기본예상대여수요"], required=False)
+    demand_in_col = find_col(cur, ["기본예상반납수요"], required=False)
+    name_col = find_col(cur, ["대여소명", "대여소 명"], required=False)
+    if "station_key" not in cur.columns or not demand_out_col or not demand_in_col:
+        return pd.DataFrame()
+
+    agg = cur.groupby("station_key", as_index=False).agg(
+        기본예상대여수요=(demand_out_col, "mean"),
+        기본예상반납수요=(demand_in_col, "mean"),
+    )
+    if name_col:
+        names = cur.groupby("station_key", as_index=False)[name_col].first().rename(columns={name_col: "대여소명_과거"})
+        agg = agg.merge(names, on="station_key", how="left")
+    return agg
 
 
-@st.cache_data(ttl=300)
-def fetch_city_weather(api_key: str, area_name: str) -> dict:
-    if not api_key:
-        raise ValueError("도시데이터 API 키가 비어 있습니다.")
-    if not area_name:
-        raise ValueError("도시데이터 장소명이 비어 있습니다.")
+def get_weather_coef(coef_df: pd.DataFrame, time_group: str, weather_condition: str) -> Tuple[float, float]:
+    if coef_df.empty:
+        return 1.0, 1.0
+    df = coef_df.copy()
+    tg_col = find_col(df, ["시간대그룹"], required=False)
+    wc_col = find_col(df, ["기상조건"], required=False)
+    out_col = find_col(df, ["대여수요_날씨보정계수", "대여수요보정계수"], required=False)
+    in_col = find_col(df, ["반납수요_날씨보정계수", "반납수요보정계수"], required=False)
+    if not all([tg_col, wc_col, out_col, in_col]):
+        return 1.0, 1.0
 
-    enc_area = urllib.parse.quote(area_name)
-    url = f"http://openapi.seoul.go.kr:8088/{api_key}/json/citydata/1/5/{enc_area}"
-    r = requests.get(url, timeout=12)
-    r.raise_for_status()
-    js = r.json()
-
-    # CITYDATA 구조 안에서 날씨 값을 유연하게 탐색
-    temp = to_float(find_key_recursive(js, "TEMP"), 0)
-    humidity = to_float(find_key_recursive(js, "HUMIDITY"), 0)
-    wind_spd = to_float(find_key_recursive(js, "WIND_SPD"), 0)
-    rain = to_float(find_key_recursive(js, "PRECIPITATION"), 0)
-    ptype = find_key_recursive(js, "PRECPT_TYPE")
-    weather_time = find_key_recursive(js, "WEATHER_TIME")
-
-    return {
-        "AREA_NM": area_name,
-        "TEMP": temp,
-        "HUMIDITY": humidity,
-        "WIND_SPD": wind_spd,
-        "PRECIPITATION": rain,
-        "PRECPT_TYPE": ptype,
-        "WEATHER_TIME": weather_time,
-        "raw": js,
-    }
+    exact = df[(df[tg_col].astype(str) == str(time_group)) & (df[wc_col].astype(str) == str(weather_condition))]
+    if exact.empty:
+        # 같은 시간대만 평균 fallback
+        exact = df[df[tg_col].astype(str) == str(time_group)]
+    if exact.empty:
+        return 1.0, 1.0
+    return float(pd.to_numeric(exact[out_col], errors="coerce").mean()), float(pd.to_numeric(exact[in_col], errors="coerce").mean())
 
 
-# -----------------------------
-# 수요·후보 계산
-# -----------------------------
-def make_realtime_candidates(
+def build_candidates(
     bike_df: pd.DataFrame,
-    data: dict,
-    weather_cond: str,
-    now: datetime,
+    base_current: pd.DataFrame,
+    priority_df: pd.DataFrame,
+    coef_out: float,
+    coef_in: float,
     L: float,
     U: float,
+    top_pickup: int,
+    top_delivery: int,
 ) -> pd.DataFrame:
-    station_filter = data["station_filter"].copy()
-    base = data["base"].copy()
-    coef = data["weather_coef"].copy()
-    priority = data["priority"].copy()
+    if bike_df.empty:
+        return pd.DataFrame()
 
-    hour = now.hour
-    month = now.month
-    season = season_from_month(month)
-    weektype = weektype_from_date(now)
-    time_group = time_group_from_hour(hour)
-
-    # 여의도 대여소만 필터링
-    yeouido_ids = set(station_filter["대여소_ID"].astype(str))
-    cur = bike_df[bike_df["대여소_ID"].astype(str).isin(yeouido_ids)].copy()
-    cur = cur.merge(station_filter, on="대여소_ID", how="left")
-    cur["대여소명"] = cur["대여소명"].fillna(cur.get("대여소명_API", ""))
-
-    # 기본예상수요: 현재 시간 조건과 정확히 맞는 값 우선
-    mask = (
-        (base["시간대"].astype(int) == hour)
-        & (base["평일주말"].astype(str) == weektype)
-        & (base["월"].astype(int) == month)
-        & (base["계절"].astype(str) == season)
-    )
-    base_now = base.loc[mask, ["대여소_ID", "기본예상대여수요", "기본예상반납수요", "평균총이용건수", "평균순유출량"]].copy()
-
-    # 혹시 현재 조건이 비어 있으면 시간대그룹 기준 평균으로 fallback
-    if base_now.empty:
-        base_now = (
-            base[base["시간대그룹"].astype(str) == time_group]
-            .groupby("대여소_ID", as_index=False)[["기본예상대여수요", "기본예상반납수요", "평균총이용건수", "평균순유출량"]]
-            .mean()
-        )
-
-    # 날씨보정계수
-    wc = coef[(coef["시간대그룹"].astype(str) == time_group) & (coef["기상조건"].astype(str) == weather_cond)]
-    if len(wc) == 0:
-        rent_coef, return_coef = 1.0, 1.0
-        coef_note = "현재 기상조건과 정확히 일치하는 보정계수가 없어 1.0 적용"
+    df = bike_df.copy()
+    if not base_current.empty:
+        df = df.merge(base_current, on="station_key", how="left")
     else:
-        rent_coef = float(wc.iloc[0]["대여수요_날씨보정계수"])
-        return_coef = float(wc.iloc[0]["반납수요_날씨보정계수"])
-        coef_note = "현재 기상조건 보정계수 적용"
+        df["기본예상대여수요"] = 0
+        df["기본예상반납수요"] = 0
 
-    out = cur.merge(base_now, on="대여소_ID", how="left")
-    out = out.merge(priority[["대여소_ID", "우선순위기초점수", "평소이용빈도", "평균예측불균형"]], on="대여소_ID", how="left")
+    # priority 붙이기
+    if not priority_df.empty:
+        pr = priority_df.copy()
+        sid_col = find_col(pr, ["대여소_ID", "대여소ID"], required=False)
+        if sid_col:
+            pr["station_key"] = pr[sid_col].apply(norm_station_id)
+            score_col = find_col(pr, ["우선순위기초점수", "우선순위점수"], required=False)
+            freq_col = find_col(pr, ["평소이용빈도"], required=False)
+            cols = ["station_key"] + [c for c in [score_col, freq_col] if c]
+            pr = pr[cols].drop_duplicates("station_key")
+            df = df.merge(pr, on="station_key", how="left")
 
-    for c in ["기본예상대여수요", "기본예상반납수요", "우선순위기초점수"]:
-        out[c] = out[c].fillna(0)
+    if "우선순위기초점수" not in df.columns:
+        df["우선순위기초점수"] = 0.5
+    df["우선순위기초점수"] = pd.to_numeric(df["우선순위기초점수"], errors="coerce").fillna(0.5)
 
-    out["대여수요보정계수"] = rent_coef
-    out["반납수요보정계수"] = return_coef
-    out["예측대여수요"] = out["기본예상대여수요"] * rent_coef
-    out["예측반납수요"] = out["기본예상반납수요"] * return_coef
-    out["예측순유출량"] = out["예측대여수요"] - out["예측반납수요"]
-    out["예상재고"] = out["현재자전거수"] + out["예측반납수요"] - out["예측대여수요"]
-    out["부족기준"] = L * out["거치대수"]
-    out["과잉기준"] = U * out["거치대수"]
-    out["수거필요량"] = np.maximum(0, out["예상재고"] - out["과잉기준"])
-    out["재배치필요량"] = np.maximum(0, out["부족기준"] - out["예상재고"])
+    for c in ["기본예상대여수요", "기본예상반납수요", "현재자전거수", "거치대수"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # 실제 자전거 대수이므로 반올림 처리. 시연에서는 1대 미만 수요는 제외하기 위해 ceil 사용.
-    out["수거필요량"] = np.ceil(out["수거필요량"]).astype(int)
-    out["재배치필요량"] = np.ceil(out["재배치필요량"]).astype(int)
-    out["총불균형"] = out["수거필요량"] + out["재배치필요량"]
-    out["후보우선점수"] = out["총불균형"] * (1 + out["우선순위기초점수"].fillna(0))
-    out.attrs["context"] = {
-        "hour": hour,
-        "month": month,
-        "season": season,
-        "weektype": weektype,
-        "time_group": time_group,
-        "weather_cond": weather_cond,
-        "rent_coef": rent_coef,
-        "return_coef": return_coef,
-        "coef_note": coef_note,
-    }
-    return out
+    df["예측대여수요"] = df["기본예상대여수요"] * coef_out
+    df["예측반납수요"] = df["기본예상반납수요"] * coef_in
+    df["예상재고"] = df["현재자전거수"] + df["예측반납수요"] - df["예측대여수요"]
+
+    df["과잉기준"] = U * df["거치대수"]
+    df["부족기준"] = L * df["거치대수"]
+    df["수거필요량"] = np.maximum(0, np.ceil(df["예상재고"] - df["과잉기준"])).astype(int)
+    df["재배치필요량"] = np.maximum(0, np.ceil(df["부족기준"] - df["예상재고"])).astype(int)
+    df["처리전불균형"] = df["수거필요량"] + df["재배치필요량"]
+
+    df["후보점수"] = (
+        df["처리전불균형"] * 0.55
+        + df["우선순위기초점수"] * 10 * 0.30
+        + (df["예측대여수요"] - df["예측반납수요"]).abs() * 0.15
+    )
+
+    pickups = df[df["수거필요량"] > 0].sort_values("후보점수", ascending=False).head(top_pickup).copy()
+    pickups["후보유형"] = "수거"
+    pickups["필요량"] = pickups["수거필요량"]
+
+    deliveries = df[df["재배치필요량"] > 0].sort_values("후보점수", ascending=False).head(top_delivery).copy()
+    deliveries["후보유형"] = "재배치"
+    deliveries["필요량"] = deliveries["재배치필요량"]
+
+    cand = pd.concat([pickups, deliveries], ignore_index=True)
+    if cand.empty:
+        return cand
+
+    # 지도용 정리
+    cand["대여소명"] = cand.get("대여소명_API", cand.get("대여소명_과거", ""))
+    keep_cols = [
+        "station_key", "대여소_ID_API", "대여소명", "후보유형", "필요량", "현재자전거수", "거치대수", "거치율",
+        "예측대여수요", "예측반납수요", "예상재고", "수거필요량", "재배치필요량", "처리전불균형",
+        "우선순위기초점수", "후보점수", "위도", "경도"
+    ]
+    keep_cols = [c for c in keep_cols if c in cand.columns]
+    return cand[keep_cols].copy()
 
 
-@dataclass
-class Step:
-    vehicle: int
-    order: int
-    station_id: str
-    station_name: str
-    action: str
-    qty: int
-    load_after: int
-    lat: float
-    lon: float
+# ============================================================
+# 7. 휴리스틱 경로 추천
+# ============================================================
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dl/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
 
 
-def greedy_routes(candidates: pd.DataFrame, start_lat: float, start_lon: float, vehicle_count: int, capacity: int):
-    """간단 휴리스틱: 가까운 수거 후보에서 싣고, 가까운 재배치 후보에 배치."""
-    work = candidates.copy()
-    work["remaining_pickup"] = work["수거필요량"].astype(int)
-    work["remaining_dropoff"] = work["재배치필요량"].astype(int)
-    steps: list[Step] = []
+def nearest_index(current: Tuple[float, float], rows: pd.DataFrame) -> Optional[int]:
+    if rows.empty:
+        return None
+    d = rows.apply(lambda r: haversine_m(current[0], current[1], r["위도"], r["경도"]), axis=1)
+    return int(d.idxmin())
 
-    for k in range(1, vehicle_count + 1):
-        lat, lon = start_lat, start_lon
-        load = 0
-        order = 1
+
+def greedy_routes(candidates: pd.DataFrame, depot_lat: float, depot_lon: float, vehicle_count: int, capacity: int) -> Tuple[List[List[Dict[str, Any]]], pd.DataFrame, Dict[str, float]]:
+    """
+    수거 후보에서 싣고, 재배치 후보에 배치하는 단순 휴리스틱.
+    차량별 경로를 분리해서 반환한다.
+    """
+    cand = candidates.copy().reset_index(drop=True)
+    cand["남은수거"] = cand.get("수거필요량", 0).astype(float)
+    cand["남은재배치"] = cand.get("재배치필요량", 0).astype(float)
+    cand["처리수거량"] = 0.0
+    cand["처리재배치량"] = 0.0
+
+    routes: List[List[Dict[str, Any]]] = []
+
+    for k in range(vehicle_count):
+        load = 0.0
+        cur = (depot_lat, depot_lon)
+        route = [{"type": "depot", "name": "출발지", "lat": depot_lat, "lon": depot_lon, "action": "출발", "amount": 0, "load_after": load}]
+
         safety = 0
-        while safety < 80:
+        while safety < 100:
             safety += 1
-            did = False
+            pickups = cand[(cand["남은수거"] > 0) & (load < capacity)].copy()
+            deliveries = cand[(cand["남은재배치"] > 0) & (load > 0)].copy()
 
-            # 1) 적재공간이 있으면 가까운 수거 후보 방문
-            pickups = work[work["remaining_pickup"] > 0].copy()
-            if load < capacity and not pickups.empty:
-                pickups["dist"] = pickups.apply(lambda r: haversine_m(lat, lon, r["위도"], r["경도"]), axis=1)
-                # 거리와 우선점수를 함께 고려
-                pickups["score"] = pickups["dist"] / (1 + pickups["후보우선점수"].fillna(0))
-                r = pickups.sort_values("score").iloc[0]
-                qty = int(min(r["remaining_pickup"], capacity - load))
-                if qty > 0:
-                    idx = r.name
-                    work.loc[idx, "remaining_pickup"] -= qty
-                    load += qty
-                    lat, lon = float(r["위도"]), float(r["경도"])
-                    steps.append(Step(k, order, str(r["대여소_ID"]), str(r["대여소명"]), "수거", qty, load, lat, lon))
-                    order += 1
-                    did = True
-
-            # 2) 싣고 있는 자전거가 있으면 가까운 재배치 후보 방문
-            dropoffs = work[work["remaining_dropoff"] > 0].copy()
-            if load > 0 and not dropoffs.empty:
-                dropoffs["dist"] = dropoffs.apply(lambda r: haversine_m(lat, lon, r["위도"], r["경도"]), axis=1)
-                dropoffs["score"] = dropoffs["dist"] / (1 + dropoffs["후보우선점수"].fillna(0))
-                r = dropoffs.sort_values("score").iloc[0]
-                qty = int(min(r["remaining_dropoff"], load))
-                if qty > 0:
-                    idx = r.name
-                    work.loc[idx, "remaining_dropoff"] -= qty
-                    load -= qty
-                    lat, lon = float(r["위도"]), float(r["경도"])
-                    steps.append(Step(k, order, str(r["대여소_ID"]), str(r["대여소명"]), "배치", qty, load, lat, lon))
-                    order += 1
-                    did = True
-
-            if not did:
-                break
-            if work["remaining_pickup"].sum() <= 0 and (work["remaining_dropoff"].sum() <= 0 or load == 0):
+            # 적재가 없으면 반드시 수거부터, 적재가 있으면 가까운 재배치 우선
+            if load <= 0 and not pickups.empty:
+                idx = nearest_index(cur, pickups)
+                amount = min(capacity - load, cand.loc[idx, "남은수거"])
+                cand.loc[idx, "남은수거"] -= amount
+                cand.loc[idx, "처리수거량"] += amount
+                load += amount
+                row = cand.loc[idx]
+                action = "수거"
+            elif load > 0 and not deliveries.empty:
+                idx = nearest_index(cur, deliveries)
+                amount = min(load, cand.loc[idx, "남은재배치"])
+                cand.loc[idx, "남은재배치"] -= amount
+                cand.loc[idx, "처리재배치량"] += amount
+                load -= amount
+                row = cand.loc[idx]
+                action = "재배치"
+            elif not pickups.empty and load < capacity:
+                idx = nearest_index(cur, pickups)
+                amount = min(capacity - load, cand.loc[idx, "남은수거"])
+                cand.loc[idx, "남은수거"] -= amount
+                cand.loc[idx, "처리수거량"] += amount
+                load += amount
+                row = cand.loc[idx]
+                action = "수거"
+            else:
                 break
 
-    route_df = pd.DataFrame([s.__dict__ for s in steps])
-    work["처리후_남은수거"] = work["remaining_pickup"].astype(int)
-    work["처리후_남은재배치"] = work["remaining_dropoff"].astype(int)
-    return route_df, work
+            cur = (float(row["위도"]), float(row["경도"]))
+            route.append({
+                "type": action,
+                "station_key": row.get("station_key", ""),
+                "name": row.get("대여소명", ""),
+                "lat": float(row["위도"]),
+                "lon": float(row["경도"]),
+                "action": action,
+                "amount": int(round(amount)),
+                "load_after": int(round(load)),
+            })
+
+        route.append({"type": "depot", "name": "종료지", "lat": depot_lat, "lon": depot_lon, "action": "복귀", "amount": 0, "load_after": int(round(load))})
+        routes.append(route)
+
+    cand["최적화후재고"] = cand["예상재고"] - cand["처리수거량"] + cand["처리재배치량"]
+    cand["처리후수거필요량"] = np.maximum(0, np.ceil(cand["최적화후재고"] - 0))  # 아래에서 기준으로 재계산
+    cand["남은불균형"] = cand["남은수거"] + cand["남은재배치"]
+
+    before = float(candidates["처리전불균형"].sum()) if not candidates.empty else 0.0
+    processed = float(cand["처리수거량"].sum() + cand["처리재배치량"].sum())
+    after = float(cand["남은불균형"].sum())
+    improve = ((before - after) / before * 100) if before > 0 else 0.0
+    summary = {"before": before, "processed": processed, "after": after, "improve": improve}
+
+    return routes, cand, summary
 
 
+# ============================================================
+# 8. OSRM 실제 도로 경로 + 화살표 지도
+# ============================================================
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def fetch_osrm_route(lat1: float, lon1: float, lat2: float, lon2: float):
-    """
-    OSRM 공개 서버를 이용해 자동차 도로망 기준 경로를 가져온다.
-    실패하면 직선 경로로 fallback한다.
-    반환: (points[[lat, lon], ...], distance_m, is_osrm)
-    """
+@st.cache_data(ttl=3600, show_spinner=False)
+def osrm_route(lat1: float, lon1: float, lat2: float, lon2: float) -> Dict[str, Any]:
+    params = {"overview": "full", "geometries": "geojson", "steps": "false"}
+    url = OSRM_ROUTE_URL.format(lon1=lon1, lat1=lat1, lon2=lon2, lat2=lat2)
     try:
-        url = (
-            "https://router.project-osrm.org/route/v1/driving/"
-            f"{lon1},{lat1};{lon2},{lat2}"
-            "?overview=full&geometries=geojson&steps=false&alternatives=false"
-        )
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
-        js = r.json()
-        if js.get("code") != "Ok" or not js.get("routes"):
-            raise ValueError(js.get("message", "OSRM route not found"))
-        route = js["routes"][0]
+        data = r.json()
+        routes = data.get("routes", [])
+        if not routes:
+            raise ValueError("OSRM route empty")
+        route = routes[0]
         coords = route["geometry"]["coordinates"]
-        points = [[float(lat), float(lon)] for lon, lat in coords]
-        distance = float(route.get("distance", haversine_m(lat1, lon1, lat2, lon2)))
-        if len(points) < 2:
-            points = [[lat1, lon1], [lat2, lon2]]
-        return points, distance, True
+        latlon = [(float(lat), float(lon)) for lon, lat in coords]
+        return {
+            "ok": True,
+            "coords": latlon,
+            "distance_m": float(route.get("distance", 0)),
+            "duration_s": float(route.get("duration", 0)),
+        }
     except Exception:
-        return [[lat1, lon1], [lat2, lon2]], haversine_m(lat1, lon1, lat2, lon2), False
+        return {
+            "ok": False,
+            "coords": [(lat1, lon1), (lat2, lon2)],
+            "distance_m": haversine_m(lat1, lon1, lat2, lon2),
+            "duration_s": 0,
+        }
 
 
-def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """북쪽 기준 시계방향 bearing degree."""
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dlambda = math.radians(lon2 - lon1)
-    y = math.sin(dlambda) * math.cos(phi2)
-    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
-    return (math.degrees(math.atan2(y, x)) + 360) % 360
+def bearing_deg(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+    lat1, lon1 = map(math.radians, p1)
+    lat2, lon2 = map(math.radians, p2)
+    dlon = lon2 - lon1
+    y = math.sin(dlon) * math.cos(lat2)
+    x = math.cos(lat1)*math.sin(lat2) - math.sin(lat1)*math.cos(lat2)*math.cos(dlon)
+    brng = math.degrees(math.atan2(y, x))
+    return (brng + 360) % 360
 
 
-def point_and_bearing_at_fraction(points: list[list[float]], frac: float):
-    """폴리라인 길이의 frac 지점 좌표와 해당 구간 방향을 계산."""
-    if len(points) < 2:
-        return points[0], 0
-    seg_lens = []
-    total = 0.0
-    for a, b in zip(points[:-1], points[1:]):
-        d = haversine_m(a[0], a[1], b[0], b[1])
-        seg_lens.append(d)
-        total += d
+def interpolate_point(coords: List[Tuple[float, float]], frac: float) -> Tuple[float, float, float]:
+    """경로 전체 길이 기준 frac 위치의 lat, lon, bearing 반환."""
+    if len(coords) < 2:
+        lat, lon = coords[0]
+        return lat, lon, 0
+    seg_lengths = [haversine_m(coords[i][0], coords[i][1], coords[i+1][0], coords[i+1][1]) for i in range(len(coords)-1)]
+    total = sum(seg_lengths)
     if total <= 0:
-        a, b = points[0], points[-1]
-        return a, bearing_deg(a[0], a[1], b[0], b[1])
+        lat, lon = coords[0]
+        return lat, lon, 0
     target = total * frac
     acc = 0.0
-    for idx, d in enumerate(seg_lens):
-        a = points[idx]
-        b = points[idx + 1]
-        if acc + d >= target:
-            local = 0 if d == 0 else (target - acc) / d
-            lat = a[0] + (b[0] - a[0]) * local
-            lon = a[1] + (b[1] - a[1]) * local
-            return [lat, lon], bearing_deg(a[0], a[1], b[0], b[1])
-        acc += d
-    a, b = points[-2], points[-1]
-    return points[-1], bearing_deg(a[0], a[1], b[0], b[1])
+    for i, seg in enumerate(seg_lengths):
+        if acc + seg >= target:
+            ratio = (target - acc) / seg if seg > 0 else 0
+            lat = coords[i][0] + (coords[i+1][0] - coords[i][0]) * ratio
+            lon = coords[i][1] + (coords[i+1][1] - coords[i][1]) * ratio
+            brg = bearing_deg(coords[i], coords[i+1])
+            return lat, lon, brg
+        acc += seg
+    lat, lon = coords[-1]
+    return lat, lon, bearing_deg(coords[-2], coords[-1])
 
 
-def add_direction_arrows(m: folium.Map, points: list[list[float]], color: str):
-    """노드와 노드 사이 도로 경로 위에 방향 화살표 3개 표시."""
-    if len(points) < 2:
-        return
-    for frac in [0.25, 0.50, 0.75]:
-        pt, brg = point_and_bearing_at_fraction(points, frac)
-        # CSS 기본 화살표(➤)는 동쪽을 향하므로 bearing 보정
-        rot = brg - 90
+def add_arrow_markers(m: folium.Map, coords: List[Tuple[float, float]], color: str = "#2f9e44") -> None:
+    # 사용자가 요청한 대로 구간당 2개 정도만 표시
+    for frac in [0.35, 0.70]:
+        lat, lon, brg = interpolate_point(coords, frac)
         html = f"""
-        <div style="
-            transform: rotate({rot:.1f}deg);
-            color: {color};
-            font-size: 20px;
-            font-weight: 900;
-            text-shadow: 0 0 3px white, 0 0 5px white;
-            line-height: 20px;
-        ">➤</div>
+        <div style="font-size:22px; color:{color}; transform: rotate({brg}deg); opacity:0.85; line-height:22px;">➤</div>
         """
         folium.Marker(
-            location=pt,
-            icon=folium.DivIcon(html=html, icon_size=(20, 20), icon_anchor=(10, 10)),
-            interactive=False,
+            [lat, lon],
+            icon=folium.DivIcon(html=html, icon_size=(24, 24), icon_anchor=(12, 12)),
         ).add_to(m)
 
 
-def add_route_segment(m: folium.Map, start_pt, end_pt, color: str, tooltip: str):
-    """OSRM 도로망 경로를 그리고 화살표를 추가한다."""
-    pts, dist_m, is_osrm = fetch_osrm_route(start_pt[0], start_pt[1], end_pt[0], end_pt[1])
-    line = folium.PolyLine(
-        pts,
-        color=color,
-        weight=5,
-        opacity=0.85,
-        tooltip=f"{tooltip} · {dist_m/1000:.2f} km" + ("" if is_osrm else " · 직선 fallback"),
+def add_station_marker(m: folium.Map, node: Dict[str, Any], seq: int) -> None:
+    if node["type"] == "depot":
+        folium.Marker(
+            [node["lat"], node["lon"]],
+            tooltip=node["name"],
+            popup=f"<b>{node['name']}</b>",
+            icon=folium.Icon(color="black", icon="home", prefix="fa"),
+        ).add_to(m)
+        return
+
+    color = "red" if node["action"] == "수거" else "blue"
+    popup = (
+        f"<b>{seq}. {node['name']}</b><br>"
+        f"작업: {node['action']} {node['amount']}대<br>"
+        f"작업 후 적재량: {node['load_after']}대"
     )
-    line.add_to(m)
-    # 경로 위 방향 화살표. PolyLineTextPath도 함께 사용해 방향성이 보이도록 함.
-    add_direction_arrows(m, pts, color)
-    try:
-        PolyLineTextPath(
-            line,
-            "   ▶   ",
-            repeat=True,
-            offset=8,
-            attributes={"fill": color, "font-weight": "bold", "font-size": "12"},
-        ).add_to(m)
-    except Exception:
-        pass
-    return dist_m, is_osrm
-
-
-def build_candidate_overview_map(candidates: pd.DataFrame, start_lat: float, start_lon: float):
-    """경로선 없이 후보 대여소만 보여주는 개요 지도."""
-    center = [start_lat, start_lon]
-    if not candidates.empty:
-        center = [float(candidates["위도"].mean()), float(candidates["경도"].mean())]
-    m = folium.Map(location=center, zoom_start=14, tiles="CartoDB positron")
     folium.Marker(
-        [start_lat, start_lon],
-        popup="출발지",
-        tooltip="출발지",
-        icon=folium.Icon(color="black", icon="home"),
+        [node["lat"], node["lon"]],
+        tooltip=f"{seq}. {node['action']} {node['amount']}대 - {node['name']}",
+        popup=popup,
+        icon=folium.Icon(color=color, icon="info-sign"),
     ).add_to(m)
+
+    # 순서 번호 라벨
+    folium.Marker(
+        [node["lat"], node["lon"]],
+        icon=folium.DivIcon(
+            html=f"""
+            <div style="background:white; border:2px solid {'#fa5252' if color=='red' else '#4c6ef5'}; border-radius:14px; width:28px; height:28px; text-align:center; font-weight:bold; font-size:14px; line-height:24px; color:#333;">
+            {seq}
+            </div>
+            """,
+            icon_size=(28, 28), icon_anchor=(14, -8),
+        ),
+    ).add_to(m)
+
+
+def make_overview_map(candidates: pd.DataFrame, depot_lat: float, depot_lon: float) -> folium.Map:
+    m = folium.Map(location=[depot_lat, depot_lon], zoom_start=14, tiles="CartoDB positron")
+    folium.Marker([depot_lat, depot_lon], tooltip="출발지", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
     for _, r in candidates.iterrows():
-        if r["수거필요량"] > 0:
-            color, label = "red", f"수거 {int(r['수거필요량'])}대"
-        elif r["재배치필요량"] > 0:
-            color, label = "blue", f"배치 {int(r['재배치필요량'])}대"
-        else:
-            color, label = "gray", "후보"
-        html = f"""
-        <b>{r['대여소명']}</b><br>
-        ID: {r['대여소_ID']}<br>
-        현재: {r['현재자전거수']}대 / 거치대 {r['거치대수']}개<br>
-        예상재고: {r['예상재고']:.1f}<br>
-        {label}
-        """
+        color = "red" if r["후보유형"] == "수거" else "blue"
         folium.CircleMarker(
-            [r["위도"], r["경도"]],
-            radius=8,
+            location=[r["위도"], r["경도"]],
+            radius=7,
             color=color,
             fill=True,
-            fill_opacity=0.78,
-            popup=folium.Popup(html, max_width=320),
-            tooltip=f"{r['대여소명']} · {label}",
+            fill_opacity=0.75,
+            tooltip=f"{r['후보유형']} {int(r['필요량'])}대 | {r['대여소명']}",
+            popup=f"<b>{r['대여소명']}</b><br>{r['후보유형']} 필요량: {int(r['필요량'])}대",
         ).add_to(m)
     return m
 
 
-def build_vehicle_route_map(candidates: pd.DataFrame, routes: pd.DataFrame, vehicle_id: int, start_lat: float, start_lon: float):
-    """차량 하나의 도로망 경로만 보여주는 지도."""
-    grp = routes[routes["vehicle"] == vehicle_id].sort_values("order").copy()
-    center = [start_lat, start_lon]
-    if not grp.empty:
-        center = [float(grp["lat"].mean()), float(grp["lon"].mean())]
+def make_vehicle_route_map(route: List[Dict[str, Any]], vehicle_no: int) -> Tuple[folium.Map, pd.DataFrame, Dict[str, float]]:
+    # 차량별 개별 지도: 이 지도에는 해당 차량 경로만 들어감
+    center_lat = np.mean([n["lat"] for n in route])
+    center_lon = np.mean([n["lon"] for n in route])
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=14, tiles="CartoDB positron")
 
-    m = folium.Map(location=center, zoom_start=14, tiles="CartoDB positron")
-    folium.Marker(
-        [start_lat, start_lon],
-        popup="출발지",
-        tooltip="출발지",
-        icon=folium.Icon(color="black", icon="home"),
-    ).add_to(m)
-
-    if grp.empty:
-        return m, 0.0, 0
-
-    color_palette = ["green", "purple", "orange", "darkred", "cadetblue", "darkgreen"]
-    color = color_palette[(vehicle_id - 1) % len(color_palette)]
-
-    # 방문 지점 마커
-    for _, s in grp.iterrows():
-        action_color = "red" if s["action"] == "수거" else "blue"
-        html = f"""
-        <b>차량 {int(s['vehicle'])} - {int(s['order'])}번째 방문</b><br>
-        {s['station_name']}<br>
-        작업: {s['action']} {int(s['qty'])}대<br>
-        작업 후 적재량: {int(s['load_after'])}대
-        """
-        folium.Marker(
-            [s["lat"], s["lon"]],
-            tooltip=f"{int(s['order'])}. {s['station_name']} · {s['action']} {int(s['qty'])}대",
-            popup=folium.Popup(html, max_width=320),
-            icon=folium.Icon(color=action_color, icon="info-sign"),
-        ).add_to(m)
-        folium.Marker(
-            [s["lat"], s["lon"]],
-            icon=folium.DivIcon(
-                html=f"<div style='font-size:13px;background:white;border:2px solid {action_color};border-radius:12px;padding:2px 6px;font-weight:bold'>{int(s['order'])}</div>",
-                icon_size=(30, 24),
-                icon_anchor=(15, 12),
-            ),
-            interactive=False,
-        ).add_to(m)
-
-    # 출발지 -> 각 방문지 도로망 경로
-    route_points = [[start_lat, start_lon]] + grp[["lat", "lon"]].values.tolist()
     total_dist = 0.0
-    fallback_count = 0
-    for idx in range(len(route_points) - 1):
-        a = route_points[idx]
-        b = route_points[idx + 1]
-        dist_m, is_osrm = add_route_segment(
-            m,
-            a,
-            b,
-            color=color,
-            tooltip=f"차량 {vehicle_id} {idx}→{idx+1} 구간",
-        )
-        total_dist += dist_m
-        fallback_count += 0 if is_osrm else 1
+    osrm_fail = 0
+    table_rows = []
 
-    # 지도 bounds 맞추기
-    try:
-        m.fit_bounds(route_points, padding=(30, 30))
-    except Exception:
-        pass
-    return m, total_dist, fallback_count
+    for i, node in enumerate(route):
+        add_station_marker(m, node, i)
+        table_rows.append({
+            "순서": i,
+            "장소": node["name"],
+            "작업": node["action"],
+            "수량": node.get("amount", 0),
+            "작업 후 적재량": node.get("load_after", 0),
+        })
+
+    for i in range(len(route) - 1):
+        a, b = route[i], route[i+1]
+        res = osrm_route(a["lat"], a["lon"], b["lat"], b["lon"])
+        coords = res["coords"]
+        total_dist += res["distance_m"]
+        if not res["ok"]:
+            osrm_fail += 1
+
+        folium.PolyLine(
+            coords,
+            color="#2f9e44",
+            weight=5,
+            opacity=0.78,
+            tooltip=f"차량 {vehicle_no}: {a['name']} → {b['name']}",
+        ).add_to(m)
+        add_arrow_markers(m, coords, color="#2f9e44")
+
+    return m, pd.DataFrame(table_rows), {"distance_m": total_dist, "osrm_fail": osrm_fail}
 
 
-# -----------------------------
-# 화면 구성
-# -----------------------------
-st.title("🚲 여의도 따릉이 실시간 수거·재배치 경로 추천 데모")
-st.caption(
-    "실시간 API + 과거 수요모델 + 휴리스틱 경로 추천으로 "
-    "수거·재배치 후보와 차량별 경로를 시각화합니다. 배포용 버전이므로 Gurobi는 포함하지 않습니다."
-)
+# ============================================================
+# 9. 화면 구성
+# ============================================================
 
-data = load_csv_data()
-thresholds = parse_thresholds(data["thresholds"])
+st.title("🚲 여의도 따릉이 수거·재배치 경로 추천 대시보드")
+st.caption("배포용 버전: 실시간 API + 과거 수요모델 + 휴리스틱 경로 추천. 차량별 경로 지도는 각각 분리해서 표시합니다.")
 
-# 결과가 Streamlit rerun 때문에 사라지지 않도록 세션에 저장
-if "route_bundle" not in st.session_state:
-    st.session_state.route_bundle = None
+# session state 초기화
+for key in ["candidates", "routes", "processed", "summary", "weather", "weather_cond", "ctx"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
 
-# API 키는 화면에 노출하지 않고 Streamlit Cloud Secrets에서만 불러옴
-bike_key = get_secret_or_empty("SEOUL_BIKE_API_KEY")
-city_key = get_secret_or_empty("SEOUL_CITYDATA_API_KEY")
+static = load_static_data()
 
-with st.sidebar:
-    st.header("⚙️ 실행 설정")
+# Secrets에서만 API 키 로드. 화면 입력창 없음.
+try:
+    bike_key = st.secrets["SEOUL_BIKE_API_KEY"]
+except Exception:
+    bike_key = ""
+try:
+    city_key = st.secrets["SEOUL_CITYDATA_API_KEY"]
+except Exception:
+    city_key = ""
 
-    if bike_key and city_key:
-        st.success("API 키 로드 완료")
-        st.caption("API 키는 Streamlit Secrets에서 자동으로 불러옵니다.")
-    else:
-        st.error("API 키가 아직 설정되지 않았습니다.")
-        st.caption("Streamlit Cloud → App settings → Secrets에 API 키를 넣어주세요.")
+if not bike_key or not city_key:
+    st.markdown(
+        "<div class='warn-box'>Streamlit Secrets에 SEOUL_BIKE_API_KEY와 SEOUL_CITYDATA_API_KEY를 넣어야 실시간 API가 작동합니다.</div>",
+        unsafe_allow_html=True,
+    )
 
-    places = data["places"].copy()
-    default_idx = 0
-    if "AREA_NM" in places.columns:
-        names = places["AREA_NM"].dropna().astype(str).tolist()
-        for cand in ["여의도", "여의도한강공원", "국회의사당", "더현대서울"]:
-            if cand in names:
-                default_idx = names.index(cand)
-                break
-        area_name = st.selectbox("도시데이터 장소명", names, index=default_idx if names else 0)
-    else:
-        area_name = st.text_input("도시데이터 장소명", value="여의도")
+# 사이드바 설정
+st.sidebar.header("⚙️ 실행 설정")
 
-    st.divider()
-    vehicle_count = st.slider("차량 수", 1, 5, 2)
-    capacity = st.number_input("차량 1대 적재 용량", min_value=1, max_value=50, value=15, step=1)
-    L = st.slider("부족 기준 거치율 L", 0.0, 1.0, 0.30, 0.05)
-    U = st.slider("과잉 기준 거치율 U", 0.0, 1.0, 0.80, 0.05)
-    pickup_n = st.slider("수거 후보 수", 1, 20, 6)
-    dropoff_n = st.slider("재배치 후보 수", 1, 20, 6)
+# 장소명 선택
+areas_df = static["areas"]
+area_options = ["여의도"]
+if not areas_df.empty:
+    possible_cols = ["AREA_NM", "장소명", "핫스팟 장소명", "AREA"]
+    area_col = find_col(areas_df, possible_cols, required=False)
+    if area_col:
+        vals = areas_df[area_col].dropna().astype(str).unique().tolist()
+        area_options = vals if vals else area_options
 
-    st.divider()
-    st.markdown("**출발지 좌표**")
-    preset = st.selectbox("출발지 프리셋", ["여의도역", "국회의사당역", "여의나루역", "직접 입력"])
-    presets = {
-        "여의도역": (37.5216, 126.9243),
-        "국회의사당역": (37.5281, 126.9178),
-        "여의나루역": (37.5271, 126.9329),
-    }
-    if preset == "직접 입력":
-        start_lat = st.number_input("출발지 위도", value=37.5216, format="%.6f")
-        start_lon = st.number_input("출발지 경도", value=126.9243, format="%.6f")
-    else:
-        start_lat, start_lon = presets[preset]
-        st.caption(f"{preset}: {start_lat:.6f}, {start_lon:.6f}")
+# 여의도 관련 장소를 기본값으로
+default_idx = 0
+for i, a in enumerate(area_options):
+    if "여의" in a:
+        default_idx = i
+        break
+area_nm = st.sidebar.selectbox("도시데이터 장소명", area_options, index=default_idx)
 
-    run = st.button("실시간 경로 추천 실행", type="primary", use_container_width=True)
-    clear = st.button("결과 초기화", use_container_width=True)
+vehicle_count = st.sidebar.number_input("차량 수", min_value=1, max_value=5, value=2, step=1)
+capacity = st.sidebar.number_input("차량 용량", min_value=1, max_value=30, value=15, step=1)
+L = st.sidebar.slider("부족 기준 거치율 L", min_value=0.0, max_value=1.0, value=0.30, step=0.05)
+U = st.sidebar.slider("과잉 기준 거치율 U", min_value=0.0, max_value=1.0, value=0.80, step=0.05)
+top_pickup = st.sidebar.slider("수거 후보 수", min_value=1, max_value=20, value=6, step=1)
+top_delivery = st.sidebar.slider("재배치 후보 수", min_value=1, max_value=20, value=6, step=1)
 
-if clear:
-    st.session_state.route_bundle = None
+st.sidebar.subheader("출발지 좌표")
+depot_lat = st.sidebar.number_input("출발지 위도", value=37.5235, format="%.6f")
+depot_lon = st.sidebar.number_input("출발지 경도", value=126.9250, format="%.6f")
+
+col_run, col_clear = st.sidebar.columns(2)
+run_clicked = col_run.button("경로 추천 실행", type="primary", use_container_width=True)
+clear_clicked = col_clear.button("초기화", use_container_width=True)
+
+if clear_clicked:
+    for key in ["candidates", "routes", "processed", "summary", "weather", "weather_cond", "ctx"]:
+        st.session_state[key] = None
     st.rerun()
 
-with st.expander("이 대시보드가 하는 일", expanded=False):
-    st.markdown(
-        """
-        1. 따릉이 실시간 API에서 현재 자전거 수, 거치대 수, 대여소 좌표를 가져옵니다.  
-        2. 서울시 도시데이터 API에서 현재 기온, 습도, 풍속, 강수량을 가져옵니다.  
-        3. 과거 데이터로 만든 기본예상수요와 날씨 보정계수를 결합합니다.  
-        4. 예상재고를 계산하고, 부족/과잉 기준에 따라 수거·재배치 후보를 선정합니다.  
-        5. Greedy 휴리스틱으로 차량별 경로를 추천하고, 지도와 표에 보여줍니다.  
-        
-        ※ 배포 환경 안정성을 위해 이 버전에는 Gurobi가 들어가지 않습니다. Gurobi 기반 MILP는 동일한 후보 입력값을 사용하는 별도 로컬 구현 단계로 분리합니다.
-        """
-    )
+if run_clicked:
+    with st.spinner("실시간 API 호출 및 후보 계산 중..."):
+        ctx = current_time_context()
+        citydata = fetch_citydata_api(city_key, area_nm)
+        weather = parse_weather(citydata)
+        thresholds = get_weather_thresholds(static["threshold"])
+        weather_cond = classify_weather(weather, thresholds)
 
-# 버튼을 눌렀을 때만 API와 경로 추천을 실행하고, 결과는 세션에 저장
-if run:
-    if not bike_key or not city_key:
-        st.error("API 키가 비어 있습니다. Streamlit Cloud의 Secrets에 API 키를 먼저 입력해 주세요.")
-        st.stop()
+        bike_all = fetch_bike_api(bike_key)
+        bike_y = filter_yeouido_stations(bike_all, static["filter"])
+        base_current = prepare_base_for_current(static["base"], ctx)
+        coef_out, coef_in = get_weather_coef(static["coef"], ctx["시간대그룹"], weather_cond["기상조건"])
 
-    try:
-        with st.spinner("실시간 따릉이 API 호출 중..."):
-            bike_df = fetch_bike_api(bike_key)
-        with st.spinner("실시간 도시데이터 API 호출 중..."):
-            city_weather = fetch_city_weather(city_key, area_name)
-    except Exception as e:
-        st.error("API 호출 중 오류가 발생했어. API 키, 호출 제한, 장소명을 확인해줘.")
-        st.exception(e)
-        st.stop()
+        candidates = build_candidates(
+            bike_y,
+            base_current,
+            static["priority"],
+            coef_out,
+            coef_in,
+            L,
+            U,
+            int(top_pickup),
+            int(top_delivery),
+        )
 
-    now = datetime.now(KST)
-    weather_class = classify_weather(
-        temp=to_float(city_weather["TEMP"], 0),
-        humidity=to_float(city_weather["HUMIDITY"], 0),
-        wind_spd=to_float(city_weather["WIND_SPD"], 0),
-        rain=to_float(city_weather["PRECIPITATION"], 0),
-        thresholds=thresholds,
-    )
+        if candidates.empty:
+            st.error("수거·재배치 후보가 생성되지 않았습니다. 여의도 대여소 필터, API 키, 기준 L/U를 확인해주세요.")
+        else:
+            routes, processed, summary = greedy_routes(candidates, depot_lat, depot_lon, int(vehicle_count), int(capacity))
+            st.session_state.candidates = candidates
+            st.session_state.routes = routes
+            st.session_state.processed = processed
+            st.session_state.summary = summary
+            st.session_state.weather = weather
+            st.session_state.weather_cond = weather_cond
+            st.session_state.ctx = ctx
+            st.success("경로 추천이 완료되었습니다.")
 
-    candidates_all = make_realtime_candidates(
-        bike_df=bike_df,
-        data=data,
-        weather_cond=weather_class["기상조건"],
-        now=now,
-        L=L,
-        U=U,
-    )
-    context = candidates_all.attrs.get("context", {})
 
-    pickup_df = candidates_all[candidates_all["수거필요량"] > 0].sort_values("후보우선점수", ascending=False).head(pickup_n)
-    dropoff_df = candidates_all[candidates_all["재배치필요량"] > 0].sort_values("후보우선점수", ascending=False).head(dropoff_n)
-    selected = pd.concat([pickup_df, dropoff_df], ignore_index=True)
+# ============================================================
+# 10. 결과 출력: session_state 기반으로 유지
+# ============================================================
 
-    if selected.empty:
-        st.warning("현재 설정 기준에서는 수거·재배치 후보가 없습니다. 부족/과잉 기준 L, U를 조정해봐.")
-        st.session_state.route_bundle = None
-        st.stop()
+if st.session_state.summary is None:
+    st.info("왼쪽 설정을 확인한 뒤 **경로 추천 실행**을 누르면 결과가 표시됩니다.")
 
-    routes, after_df = greedy_routes(selected, start_lat, start_lon, vehicle_count, capacity)
-
-    before_imbalance = int(selected["수거필요량"].sum() + selected["재배치필요량"].sum())
-    after_imbalance = int(after_df["처리후_남은수거"].sum() + after_df["처리후_남은재배치"].sum())
-    processed = before_imbalance - after_imbalance
-    improve = 0 if before_imbalance == 0 else processed / before_imbalance * 100
-
-    st.session_state.route_bundle = {
-        "now": now,
-        "city_weather": city_weather,
-        "weather_class": weather_class,
-        "context": context,
-        "pickup_df": pickup_df,
-        "dropoff_df": dropoff_df,
-        "selected": selected,
-        "routes": routes,
-        "after_df": after_df,
-        "before_imbalance": before_imbalance,
-        "after_imbalance": after_imbalance,
-        "processed": processed,
-        "improve": improve,
-        "start_lat": float(start_lat),
-        "start_lon": float(start_lon),
-    }
-
-# 아직 실행 결과가 없을 때 초기 화면 표시
-if st.session_state.route_bundle is None:
-    st.info("왼쪽 사이드바 설정을 확인한 뒤 **실시간 경로 추천 실행** 버튼을 눌러줘.")
-    st.subheader("📁 현재 포함된 경량 데이터")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("여의도 대여소 수", f"{len(data['station_filter']):,}개")
-    c2.metric("기본예상수요 행 수", f"{len(data['base']):,}행")
-    c3.metric("기상조건 보정계수", f"{len(data['weather_coef']):,}개")
-    st.dataframe(data["station_filter"].head(20), use_container_width=True)
+    with st.expander("대시보드 계산 방식 보기", expanded=True):
+        st.markdown(
+            """
+            <div class="section-box">
+            <b>계산 흐름</b><br>
+            1) 따릉이 API에서 현재 자전거 수와 거치대 수를 가져옵니다.<br>
+            2) 도시데이터 API에서 현재 기온·습도·풍속·강수량을 가져옵니다.<br>
+            3) 과거 데이터에서 만든 기본예상수요와 날씨 보정계수를 현재 조건에 맞게 선택합니다.<br>
+            4) 예상재고 = 현재자전거수 + 예측반납수요 - 예측대여수요 를 계산합니다.<br>
+            5) 예상재고가 U×거치대수보다 크면 수거 후보, L×거치대수보다 작으면 재배치 후보로 둡니다.<br>
+            6) 배포용 대시보드는 휴리스틱 방식으로 차량별 수거·재배치 순서를 추천합니다.<br>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     st.stop()
 
-# 저장된 결과 표시. st_folium이나 위젯 rerun이 발생해도 결과가 유지됨
-bundle = st.session_state.route_bundle
-now = bundle["now"]
-city_weather = bundle["city_weather"]
-weather_class = bundle["weather_class"]
-context = bundle["context"]
-pickup_df = bundle["pickup_df"]
-dropoff_df = bundle["dropoff_df"]
-selected = bundle["selected"]
-routes = bundle["routes"]
-after_df = bundle["after_df"]
-before_imbalance = bundle["before_imbalance"]
-after_imbalance = bundle["after_imbalance"]
-processed = bundle["processed"]
-improve = bundle["improve"]
-start_lat = bundle["start_lat"]
-start_lon = bundle["start_lon"]
+summary = st.session_state.summary
+weather = st.session_state.weather or {}
+weather_cond = st.session_state.weather_cond or {}
+ctx = st.session_state.ctx or current_time_context()
+candidates = st.session_state.candidates
+processed = st.session_state.processed
+routes = st.session_state.routes
 
+# ① 현재 조건
 st.subheader("① 현재 조건")
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("현재 시점", now.strftime("%m/%d %H:%M"))
-col2.metric("시간대그룹", context.get("time_group", "-"))
-col3.metric("평일/주말", context.get("weektype", "-"))
-col4.metric("계절", context.get("season", "-"))
-col5.metric("기상조건", weather_class["기상조건"])
+metric_grid([
+    ("현재 시점", ctx["now"].strftime("%m/%d %H:%M")),
+    ("시간대그룹", str(ctx["시간대그룹"])),
+    ("평일/주말", str(ctx["평일주말"])),
+    ("계절", str(ctx["계절"])),
+    ("기상조건", str(weather_cond.get("기상조건", "-"))),
+    ("기온", f"{weather.get('TEMP', np.nan):.1f}℃" if not pd.isna(weather.get("TEMP", np.nan)) else "-"),
+    ("습도", f"{weather.get('HUMIDITY', np.nan):.1f}%" if not pd.isna(weather.get("HUMIDITY", np.nan)) else "-"),
+    ("풍속", f"{weather.get('WIND_SPD', np.nan):.1f}m/s" if not pd.isna(weather.get("WIND_SPD", np.nan)) else "-"),
+    ("강수량", f"{weather.get('PRECIPITATION', 0):.1f}mm"),
+    ("날씨 업데이트", str(weather.get("WEATHER_TIME", "-"))),
+])
 
-w1, w2, w3, w4, w5 = st.columns(5)
-w1.metric("기온", f"{city_weather['TEMP']}℃")
-w2.metric("습도", f"{city_weather['HUMIDITY']}%")
-w3.metric("풍속", f"{city_weather['WIND_SPD']}m/s")
-w4.metric("강수량", f"{city_weather['PRECIPITATION']}mm")
-w5.metric("날씨 업데이트", str(city_weather.get("WEATHER_TIME", "-")))
-
+# ② 개선 효과
 st.subheader("② 수거·재배치 후보 및 개선 효과")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("처리 전 후보 불균형", f"{before_imbalance:,}대")
-m2.metric("휴리스틱 처리량", f"{processed:,}대")
-m3.metric("처리 후 남은 불균형", f"{after_imbalance:,}대")
-m4.metric("개선율", f"{improve:.1f}%")
+metric_grid([
+    ("처리 전 후보 불균형", f"{summary['before']:.0f}대"),
+    ("휴리스틱 처리량", f"{summary['processed']:.0f}대"),
+    ("처리 후 남은 불균형", f"{summary['after']:.0f}대"),
+    ("개선율", f"{summary['improve']:.1f}%"),
+])
 
-left, right = st.columns(2)
-with left:
-    st.markdown("#### 🔴 수거 후보")
-    show_cols = ["대여소_ID", "대여소명", "현재자전거수", "거치대수", "예상재고", "수거필요량", "후보우선점수"]
-    st.dataframe(pickup_df[show_cols], use_container_width=True, hide_index=True)
-with right:
-    st.markdown("#### 🔵 재배치 후보")
-    show_cols = ["대여소_ID", "대여소명", "현재자전거수", "거치대수", "예상재고", "재배치필요량", "후보우선점수"]
-    st.dataframe(dropoff_df[show_cols], use_container_width=True, hide_index=True)
+with st.expander("계산 기준과 해석 보기", expanded=False):
+    st.markdown(
+        f"""
+        <div class="section-box">
+        <b>1. 예측수요 계산</b><br>
+        현재 조건은 <b>{ctx['시간대그룹']} / {ctx['평일주말']} / {ctx['계절']} / {weather_cond.get('기상조건','-')}</b>입니다.<br>
+        기본예상대여수요와 기본예상반납수요는 과거 데이터에서 같은 시간·요일·월·계절 조건의 평균으로 계산된 값입니다.<br><br>
+        <b>2. 예상재고 계산</b><br>
+        예상재고 = 현재자전거수 + 예측반납수요 - 예측대여수요<br><br>
+        <b>3. 수거·재배치 후보 계산</b><br>
+        수거필요량 = max(0, 예상재고 - U×거치대수), 현재 U = <b>{U:.2f}</b><br>
+        재배치필요량 = max(0, L×거치대수 - 예상재고), 현재 L = <b>{L:.2f}</b><br><br>
+        <b>4. 경로 추천 방식</b><br>
+        배포용 대시보드는 Gurobi가 아니라 휴리스틱 방식입니다. 차량은 수거 후보에서 자전거를 싣고, 가까운 재배치 후보에 배치하는 방식으로 경로를 구성합니다.<br>
+        각 차량 지도는 OSRM 도로 경로를 호출해 실제 도로 흐름에 가깝게 표시하며, 구간마다 방향 화살표를 표시합니다.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-st.subheader("③ 후보 대여소 개요 지도")
-st.caption("아래 지도는 수거·재배치 후보 위치만 보여줍니다. 차량 경로는 차량별 개별 지도에서 따로 확인합니다.")
-overview_map = build_candidate_overview_map(selected, start_lat, start_lon)
-st_folium(overview_map, width=None, height=520, key="overview_map")
+# 후보표
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("#### 수거 후보")
+    cols = ["대여소명", "필요량", "현재자전거수", "거치대수", "예상재고", "후보점수"]
+    st.dataframe(candidates[candidates["후보유형"] == "수거"][[c for c in cols if c in candidates.columns]], use_container_width=True, hide_index=True)
+with col2:
+    st.markdown("#### 재배치 후보")
+    st.dataframe(candidates[candidates["후보유형"] == "재배치"][[c for c in cols if c in candidates.columns]], use_container_width=True, hide_index=True)
 
-st.subheader("④ 차량별 도로망 경로 지도")
-st.caption("각 차량을 별도 탭으로 분리했습니다. 초록/보라/주황 경로선은 OSRM 도로망 기준이며, 화살표는 차량 진행 방향을 의미합니다.")
-if routes.empty:
-    st.warning("경로가 생성되지 않았습니다. 후보 수나 L/U 기준을 조정해봐.")
-else:
-    vehicles = sorted(routes["vehicle"].unique().tolist())
-    tabs = st.tabs([f"차량 {int(v)}" for v in vehicles])
-    total_dist_rows = []
-    html_maps = {}
-    for tab, veh in zip(tabs, vehicles):
-        with tab:
-            veh_map, total_dist, fallback_count = build_vehicle_route_map(selected, routes, int(veh), start_lat, start_lon)
-            html_maps[int(veh)] = veh_map.get_root().render()
-            c_a, c_b, c_c = st.columns(3)
-            c_a.metric("방문 지점 수", f"{len(routes[routes['vehicle'] == veh]):,}곳")
-            c_b.metric("도로망 이동거리", f"{total_dist/1000:.2f} km")
-            c_c.metric("OSRM 실패 구간", f"{fallback_count}개")
-            st_folium(veh_map, width=None, height=620, key=f"vehicle_map_{int(veh)}")
-            st.markdown("##### 차량별 방문 순서")
-            st.dataframe(
-                routes[routes["vehicle"] == veh][["vehicle", "order", "station_name", "action", "qty", "load_after"]],
-                use_container_width=True,
-                hide_index=True,
-            )
-            total_dist_rows.append({"차량": int(veh), "도로망 이동거리(km)": round(total_dist / 1000, 3), "OSRM실패구간": fallback_count})
+# 후보 개요 지도
+st.subheader("③ 후보 위치 개요 지도")
+st.caption("이 지도는 후보 위치만 보여줍니다. 차량 경로는 아래 차량별 지도에서 따로 확인합니다.")
+overview_map = make_overview_map(candidates, depot_lat, depot_lon)
+st_folium(overview_map, width=None, height=480, returned_objects=[])
 
-    st.markdown("##### 차량별 이동거리 요약")
-    st.dataframe(pd.DataFrame(total_dist_rows), use_container_width=True, hide_index=True)
+# 차량별 경로 지도
+st.subheader("④ 차량별 경로 지도")
+st.caption("각 탭에는 해당 차량의 경로만 표시됩니다. 초록색 선은 OSRM 도로 경로이며, 화살표는 진행 방향입니다.")
 
-st.subheader("⑤ 전체 차량 방문 순서")
-if routes.empty:
-    st.warning("경로가 생성되지 않았습니다. 후보 수나 L/U 기준을 조정해봐.")
-else:
-    st.dataframe(routes, use_container_width=True, hide_index=True)
+tabs = st.tabs([f"차량 {i+1}" for i in range(len(routes))])
+route_tables = []
+for i, tab in enumerate(tabs):
+    with tab:
+        vmap, table, stats = make_vehicle_route_map(routes[i], i + 1)
+        metric_grid([
+            ("차량", f"{i+1}번"),
+            ("방문 지점 수", f"{max(0, len(routes[i]) - 2)}개"),
+            ("예상 이동거리", f"{stats['distance_m']/1000:.2f}km"),
+            ("OSRM 실패 구간", f"{stats['osrm_fail']}개"),
+        ])
+        st_folium(vmap, width=None, height=560, returned_objects=[])
+        st.markdown("#### 방문 순서")
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        table["차량"] = i + 1
+        route_tables.append(table)
 
-st.subheader("⑥ 처리 후 남은 불균형")
-after_show = after_df[["대여소_ID", "대여소명", "수거필요량", "재배치필요량", "처리후_남은수거", "처리후_남은재배치"]]
-st.dataframe(after_show, use_container_width=True, hide_index=True)
+# 처리 결과표
+st.subheader("⑤ 처리 결과 상세")
+show_cols = [
+    "대여소명", "후보유형", "필요량", "현재자전거수", "거치대수", "예상재고", "처리수거량", "처리재배치량", "남은수거", "남은재배치", "남은불균형"
+]
+st.dataframe(processed[[c for c in show_cols if c in processed.columns]], use_container_width=True, hide_index=True)
 
-with st.expander("결과 파일로 저장, 선택사항", expanded=False):
-    csv_buf = io.StringIO()
-    routes.to_csv(csv_buf, index=False, encoding="utf-8-sig")
-    st.download_button("차량 경로 CSV 다운로드", csv_buf.getvalue().encode("utf-8-sig"), "route_result.csv", "text/csv")
-
-    overview_html = overview_map.get_root().render()
-    st.download_button("후보 개요 지도 HTML 다운로드", overview_html.encode("utf-8"), "candidate_overview_map.html", "text/html")
-    if not routes.empty:
-        for veh, html in html_maps.items():
-            st.download_button(f"차량 {veh} 경로 지도 HTML 다운로드", html.encode("utf-8"), f"vehicle_{veh}_route_map.html", "text/html")
+# 다운로드는 선택 사항. 화면 표시는 이미 위에서 끝남.
+with st.expander("결과 다운로드", expanded=False):
+    if route_tables:
+        all_route_table = pd.concat(route_tables, ignore_index=True)
+        st.download_button(
+            "차량별 방문 순서 CSV 다운로드",
+            data=all_route_table.to_csv(index=False).encode("utf-8-sig"),
+            file_name="vehicle_routes.csv",
+            mime="text/csv",
+        )
+    st.download_button(
+        "처리 결과 CSV 다운로드",
+        data=processed.to_csv(index=False).encode("utf-8-sig"),
+        file_name="relocation_result.csv",
+        mime="text/csv",
+    )
