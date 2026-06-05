@@ -330,6 +330,26 @@ def fetch_citydata_api(api_key: str, area_nm: str) -> Dict[str, Any]:
         return {}
 
 
+
+
+def parse_weather_time_to_kst(time_text: str) -> Optional[datetime]:
+    """도시데이터 API의 WEATHER_TIME을 KST datetime으로 변환한다.
+    실패하면 None을 반환하고, 이후 현재 KST 시간을 사용한다.
+    """
+    if not time_text:
+        return None
+    txt = str(time_text).strip()
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"]:
+        try:
+            return datetime.strptime(txt[:19], fmt).replace(tzinfo=KST)
+        except Exception:
+            pass
+    m = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\s+(\d{1,2}):(\d{1,2})", txt)
+    if m:
+        y, mo, d, h, mi = map(int, m.groups())
+        return datetime(y, mo, d, h, mi, tzinfo=KST)
+    return None
+
 def parse_weather(citydata: Dict[str, Any]) -> Dict[str, Any]:
     weather = citydata.get("WEATHER_STTS", {}) if isinstance(citydata, dict) else {}
     if isinstance(weather, list) and weather:
@@ -638,6 +658,7 @@ def balanced_greedy_routes(candidates: pd.DataFrame, depot_lat: float, depot_lon
     - 수거 후보와 재배치 후보를 후보점수 순으로 정렬
     - 차량 번호별로 round-robin 분배
     - 각 차량은 자기에게 배정된 후보 안에서 가까운 지점 우선 방문
+    - 관리소 출발 차량은 재배치 업무를 수행할 수 있도록 출발 시 적재량을 싣고 출발할 수 있음
     - 배포용 휴리스틱이므로 최적해가 아니라 발표용 경로 추천임
     """
     cand = candidates.copy().reset_index(drop=True)
@@ -669,11 +690,15 @@ def balanced_greedy_routes(candidates: pd.DataFrame, depot_lat: float, depot_lon
     routes: List[List[Dict[str, Any]]] = []
 
     for k in range(vehicle_count):
-        load = 0.0
-        cur = (depot_lat, depot_lon)
-        route = [{"type": "depot", "name": DEFAULT_DEPOT_NAME, "lat": depot_lat, "lon": depot_lon, "action": "출발", "amount": 0, "load_after": load}]
-
         assigned = cand[cand["배정차량"] == k].copy()
+        # 재배치 후보가 있는 차량은 여의도 복지관에서 자전거를 싣고 출발한다고 가정한다.
+        # 그렇지 않으면 수거 전용 차량처럼 빈 차량으로 출발한다.
+        has_delivery = (not assigned.empty) and (assigned["남은재배치"].sum() > 0)
+        load = float(capacity if has_delivery else 0)
+        cur = (depot_lat, depot_lon)
+        start_action = "적재 출발" if load > 0 else "출발"
+        route = [{"type": "depot", "name": DEFAULT_DEPOT_NAME, "lat": depot_lat, "lon": depot_lon, "action": start_action, "amount": int(round(load)), "load_after": int(round(load))}]
+
         if assigned.empty:
             # 이 차량에 배정된 후보가 없으면 출발지 표시만 유지
             route.append({"type": "depot", "name": DEFAULT_DEPOT_NAME, "lat": depot_lat, "lon": depot_lon, "action": "대기", "amount": 0, "load_after": int(round(load))})
@@ -687,15 +712,9 @@ def balanced_greedy_routes(candidates: pd.DataFrame, depot_lat: float, depot_lon
             pickups = cand.loc[assigned_idx][(cand.loc[assigned_idx, "남은수거"] > 0) & (load < capacity)].copy()
             deliveries = cand.loc[assigned_idx][(cand.loc[assigned_idx, "남은재배치"] > 0) & (load > 0)].copy()
 
-            if load <= 0 and not pickups.empty:
-                idx = nearest_index(cur, pickups)
-                amount = min(capacity - load, cand.loc[idx, "남은수거"])
-                cand.loc[idx, "남은수거"] -= amount
-                cand.loc[idx, "처리수거량"] += amount
-                load += amount
-                row = cand.loc[idx]
-                action = "수거"
-            elif load > 0 and not deliveries.empty:
+            # 우선순위: 적재량이 있으면 가까운 재배치 후보부터 처리하고,
+            # 적재 공간이 생기면 수거 후보를 처리한다.
+            if load > 0 and not deliveries.empty:
                 idx = nearest_index(cur, deliveries)
                 amount = min(load, cand.loc[idx, "남은재배치"])
                 cand.loc[idx, "남은재배치"] -= amount
@@ -703,7 +722,7 @@ def balanced_greedy_routes(candidates: pd.DataFrame, depot_lat: float, depot_lon
                 load -= amount
                 row = cand.loc[idx]
                 action = "재배치"
-            elif not pickups.empty and load < capacity:
+            elif load < capacity and not pickups.empty:
                 idx = nearest_index(cur, pickups)
                 amount = min(capacity - load, cand.loc[idx, "남은수거"])
                 cand.loc[idx, "남은수거"] -= amount
@@ -811,25 +830,33 @@ def interpolate_point(coords: List[Tuple[float, float]], frac: float) -> Tuple[f
 
 
 def add_direction_arrows_on_polyline(polyline: folium.PolyLine) -> None:
-    """PolylineTextPath로 경로 선 위에 방향 화살표를 표시한다.
-    지도 아이콘을 회전시키는 방식보다 도로 흐름을 훨씬 명확하게 보여준다.
-    """
-    try:
-        PolyLineTextPath(
-            polyline,
-            "   ➜   ",
-            repeat=True,
-            offset=7,
-            attributes={
-                "fill": "#1f7a3a",
-                "font-weight": "bold",
-                "font-size": "18px",
-                "opacity": "0.85",
-            },
-        ).add_to(polyline._parent)
-    except Exception:
-        # 일부 배포 환경에서 플러그인이 실패해도 지도는 유지
-        pass
+    # 이전 버전 호환용. 실제 화살표는 add_fixed_direction_arrows에서 표시한다.
+    return
+
+
+def add_fixed_direction_arrows(m: folium.Map, coords: List[Tuple[float, float]], arrows_per_segment: int = 2) -> None:
+    """경로 구간마다 2~3개의 큰 삼각 화살표를 고정 위치에 표시한다."""
+    if len(coords) < 2:
+        return
+    fracs = [0.35, 0.70] if arrows_per_segment <= 2 else [0.25, 0.50, 0.75]
+    for frac in fracs:
+        lat, lon, brg = interpolate_point(coords, frac)
+        html = f"""
+        <div style="
+            width: 24px; height: 24px;
+            display:flex; align-items:center; justify-content:center;
+            transform: rotate({brg}deg);
+            color:#0b7a2a;
+            font-size:24px;
+            font-weight:900;
+            text-shadow: -1px -1px 2px white, 1px -1px 2px white, -1px 1px 2px white, 1px 1px 2px white;
+        ">▲</div>
+        """
+        folium.Marker(
+            [lat, lon],
+            icon=folium.DivIcon(html=html, icon_size=(24, 24), icon_anchor=(12, 12)),
+            tooltip="진행 방향",
+        ).add_to(m)
 
 def add_station_marker(m: folium.Map, node: Dict[str, Any], seq: int) -> None:
     if node["type"] == "depot":
@@ -913,14 +940,14 @@ def make_vehicle_route_map(route: List[Dict[str, Any]], vehicle_no: int) -> Tupl
         if not res["ok"]:
             osrm_fail += 1
 
-        line = folium.PolyLine(
+        folium.PolyLine(
             coords,
             color="#2f9e44",
             weight=5,
             opacity=0.78,
             tooltip=f"차량 {vehicle_no}: {a['name']} → {b['name']}",
         ).add_to(m)
-        add_direction_arrows_on_polyline(line)
+        add_fixed_direction_arrows(m, coords, arrows_per_segment=2)
 
     return m, pd.DataFrame(table_rows), {"distance_m": total_dist, "osrm_fail": osrm_fail}
 
@@ -930,7 +957,7 @@ def make_vehicle_route_map(route: List[Dict[str, Any]], vehicle_no: int) -> Tupl
 # ============================================================
 
 st.title("🚲 여의도 따릉이 수거·재배치 경로 추천 대시보드")
-st.caption("배포용 버전: 실시간 API + 과거 수요모델 + 휴리스틱 경로 추천. 출발지는 여의도 복지관으로 고정하고, 차량별 경로 지도는 각각 분리해서 표시합니다.")
+st.caption("배포용 버전: 실시간 API + 과거 수요모델 + 휴리스틱 경로 추천. 출발지는 여의도 복지관으로 고정하고, 차량별 경로 지도는 각각 분리해서 표시합니다. 재배치 차량은 출발 시 자전거를 싣고 출발합니다.")
 
 # session state 초기화
 for key in ["candidates", "routes", "processed", "summary", "weather", "weather_cond", "ctx"]:
@@ -986,7 +1013,7 @@ top_delivery = st.sidebar.slider("재배치 후보 수", min_value=1, max_value=
 st.sidebar.subheader("출발지")
 depot_lat = DEFAULT_DEPOT_LAT
 depot_lon = DEFAULT_DEPOT_LON
-st.sidebar.info(f"{DEFAULT_DEPOT_NAME}\n위도 {depot_lat:.6f}, 경도 {depot_lon:.6f}")
+st.sidebar.info(f"{DEFAULT_DEPOT_NAME}\n위도 {depot_lat:.6f}, 경도 {depot_lon:.6f}\n재배치 차량은 여기서 자전거를 싣고 출발")
 
 col_run, col_clear = st.sidebar.columns(2)
 run_clicked = col_run.button("경로 추천 실행", type="primary", use_container_width=True)
@@ -999,9 +1026,12 @@ if clear_clicked:
 
 if run_clicked:
     with st.spinner("실시간 API 호출 및 후보 계산 중..."):
-        ctx = current_time_context()
         citydata = fetch_citydata_api(city_key, area_nm)
         weather = parse_weather(citydata)
+        # 도시데이터 API의 날씨 업데이트 시간이 있으면 그 시간을 KST 기준 현재 조건으로 사용한다.
+        # 없으면 Streamlit 서버 시간이 아니라 Asia/Seoul 시간대로 변환한 현재 시각을 사용한다.
+        ctx_time = parse_weather_time_to_kst(weather.get("WEATHER_TIME", "")) or datetime.now(KST)
+        ctx = current_time_context(ctx_time)
         thresholds = get_weather_thresholds(static["threshold"])
         weather_cond = classify_weather(weather, thresholds)
 
@@ -1106,7 +1136,7 @@ with st.expander("계산 기준과 해석 보기", expanded=False):
         수거필요량 = max(0, 예상재고 - U×거치대수), 현재 U = <b>{U:.2f}</b><br>
         재배치필요량 = max(0, L×거치대수 - 예상재고), 현재 L = <b>{L:.2f}</b><br><br>
         <b>4. 경로 추천 방식</b><br>
-        배포용 대시보드는 Gurobi가 아니라 휴리스틱 방식입니다. 차량은 수거 후보에서 자전거를 싣고, 가까운 재배치 후보에 배치하는 방식으로 경로를 구성합니다.<br>
+        배포용 대시보드는 Gurobi가 아니라 휴리스틱 방식입니다. 수거 후보가 있으면 수거 후 재배치하고, 재배치 후보만 있는 경우에는 차량이 여의도 복지관에서 자전거를 싣고 출발하여 부족 대여소에 배치합니다.<br>
         출발지는 여의도 복지관으로 고정했습니다. 시간 조건은 Streamlit 서버 시간이 아니라 한국시간(KST)을 기준으로 판정합니다.<br>차량 1대가 모든 후보를 처리하지 않도록 수거·재배치 후보를 후보점수 순으로 차량별 균등 배정한 뒤, 각 차량 안에서 가까운 지점 우선으로 경로를 구성합니다.<br>각 차량 지도는 OSRM 도로 경로를 호출해 실제 도로 흐름에 가깝게 표시하며, 경로 선 위의 화살표가 진행 방향을 나타냅니다.
         </div>
         """,
@@ -1131,7 +1161,7 @@ st_folium(overview_map, width=None, height=480, returned_objects=[])
 
 # 차량별 경로 지도
 st.subheader("④ 차량별 경로 지도")
-st.caption("각 탭에는 해당 차량의 경로만 표시됩니다. 초록색 선은 OSRM 도로 경로이며, 화살표는 진행 방향입니다.")
+st.caption("각 탭에는 해당 차량의 경로만 표시됩니다. 초록색 선은 OSRM 도로 경로이며, 선 위의 큰 삼각 화살표가 진행 방향입니다.")
 
 tabs = st.tabs([f"차량 {i+1}" for i in range(len(routes))])
 route_tables = []
