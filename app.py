@@ -577,17 +577,54 @@ def nearest_idx(current_lat, current_lon, df: pd.DataFrame) -> Optional[int]:
 
 def sequential_vehicle_routes(candidates: pd.DataFrame, vehicle_count: int, capacity: int, max_rounds: int = 3) -> Tuple[List[Dict], pd.DataFrame]:
     """
-    차량을 순차적으로 운행하되, 한 차량이 1회 적재량(capacity)만 처리하고 끝나는 것이 아니라
-    `수거 → 재배치` 회차를 여러 번 반복할 수 있게 만든 휴리스틱.
+    다차량·다회차 수거→재배치 휴리스틱.
 
-    핵심 해석:
-    - capacity는 '한 번에 싣는 최대 적재량'이지, 차량 하루 총 처리량이 아니다.
-    - max_rounds는 차량 1대가 반복할 수 있는 수거·재배치 회차 수다.
-    - 차량별 최대 처리량은 capacity × max_rounds이다.
-    - 차량 수가 늘어나면 전체 업무를 차량 간에 나누어 처리한다.
+    이전 버전의 문제:
+    - 차량 수가 늘어나도 앞 차량이 일을 독식하거나, 뒤 차량이 비어버리는 문제가 있었다.
+    - 차량 4대처럼 후보/수요보다 차량이 많아질 때 빈 route 처리에서 오류가 날 수 있었다.
+
+    개선 방식:
+    - 차량별 경로 객체를 먼저 모두 만든다.
+    - 회차(round) 기준으로 차량 1→2→3→... 순서대로 한 번씩 기회를 준다.
+    - 각 차량은 한 회차마다 `수거 → 재배치`를 최대 capacity 범위에서 수행한다.
+    - 공급 또는 재배치 수요가 떨어지면 남은 차량은 '배정 없음'으로 안전하게 표시된다.
+    - capacity는 한 번에 싣는 최대 적재량이고, 총 처리량은 capacity × max_rounds × vehicle_count까지 가능하다.
     """
+    vehicle_count = max(1, int(vehicle_count))
+    capacity = max(1, int(capacity))
+    max_rounds = max(1, int(max_rounds))
+
+    # 차량 route를 먼저 모두 만들어서 차량 수가 많아도 화면이 깨지지 않게 한다.
+    routes = []
+    current_pos = {}
+    current_load = {}
+    for k in range(1, vehicle_count + 1):
+        routes.append({
+            "vehicle": k,
+            "steps": [{
+                "visit_order": 0,
+                "name": DEPOT["name"],
+                "lat": DEPOT["lat"],
+                "lon": DEPOT["lon"],
+                "action": "출발",
+                "qty": 0,
+                "load_after": 0,
+                "station_norm": "DEPOT",
+                "round": 0,
+            }],
+            "distance_km": 0.0,
+            "osrm_failures": 0,
+            "rounds": 0,
+            "delivered": 0,
+            "picked": 0,
+        })
+        current_pos[k] = (DEPOT["lat"], DEPOT["lon"])
+        current_load[k] = 0
+
     if candidates.empty:
-        return [], pd.DataFrame()
+        for r in routes:
+            r["steps"] = []
+        return routes, pd.DataFrame()
 
     df = candidates.copy().reset_index(drop=True)
     df["남은수거"] = np.where(df["후보유형"].isin(["과잉수거", "공급수거"]), df["필요량"], 0).astype(int)
@@ -595,71 +632,38 @@ def sequential_vehicle_routes(candidates: pd.DataFrame, vehicle_count: int, capa
     df["처리수거량"] = 0
     df["처리재배치량"] = 0
 
-    routes = []
-    max_rounds = max(1, int(max_rounds))
+    # round-robin: 각 회차마다 모든 차량에 한 번씩 수거→재배치 기회를 준다.
+    for round_no in range(1, max_rounds + 1):
+        if int(df["남은재배치"].sum()) <= 0 or int(df["남은수거"].sum()) <= 0:
+            break
 
-    for k in range(1, vehicle_count + 1):
-        remaining_delivery_total = int(df["남은재배치"].sum())
-        remaining_supply_total = int(df["남은수거"].sum())
-        remaining_vehicles = vehicle_count - k + 1
-
-        if remaining_delivery_total <= 0 or remaining_supply_total <= 0:
-            routes.append({"vehicle": k, "steps": [], "distance_km": 0.0, "osrm_failures": 0, "rounds": 0})
-            continue
-
-        # 한 차량이 처리할 목표량: 남은 수요를 남은 차량 수로 나누되,
-        # 한 차량의 전체 가능 처리량(capacity × max_rounds)을 넘지 않게 한다.
-        vehicle_target = min(
-            capacity * max_rounds,
-            math.ceil(remaining_delivery_total / remaining_vehicles),
-            remaining_supply_total,
-        )
-
-        cur_lat, cur_lon = DEPOT["lat"], DEPOT["lon"]
-        load = 0
-        delivered_by_vehicle = 0
-        rounds_done = 0
-        steps = [{
-            "visit_order": 0,
-            "name": DEPOT["name"],
-            "lat": DEPOT["lat"],
-            "lon": DEPOT["lon"],
-            "action": "출발",
-            "qty": 0,
-            "load_after": 0,
-            "station_norm": "DEPOT",
-            "round": 0,
-        }]
-
-        while (
-            delivered_by_vehicle < vehicle_target
-            and rounds_done < max_rounds
-            and int(df["남은재배치"].sum()) > 0
-            and int(df["남은수거"].sum()) > 0
-        ):
-            # 이번 회차에서 처리할 목표량. 한 번 적재량은 capacity를 넘지 않음.
-            trip_target = int(min(
-                capacity,
-                vehicle_target - delivered_by_vehicle,
-                df["남은재배치"].sum(),
-                df["남은수거"].sum(),
-            ))
-            if trip_target <= 0:
+        for k in range(1, vehicle_count + 1):
+            if int(df["남은재배치"].sum()) <= 0 or int(df["남은수거"].sum()) <= 0:
                 break
 
-            # 1) 이번 회차 목표량만큼 수거
-            picked_this_round = 0
-            while picked_this_round < trip_target and load < capacity:
+            route = routes[k - 1]
+            cur_lat, cur_lon = current_pos[k]
+            load = 0  # 한 회차는 빈 적재 상태에서 수거 시작. 재배치 후 0으로 끝나는 구조.
+
+            # 이번 차량 회차에서 처리할 수 있는 최대량
+            trip_target = int(min(capacity, df["남은수거"].sum(), df["남은재배치"].sum()))
+            if trip_target <= 0:
+                continue
+
+            # 1) 수거: 가까운 공급 후보부터 차량 용량까지 싣는다.
+            picked_this_trip = 0
+            while picked_this_trip < trip_target and load < capacity and int(df["남은수거"].sum()) > 0:
                 pickup_df = df[df["남은수거"] > 0].copy()
                 if pickup_df.empty:
                     break
                 idx = nearest_idx(cur_lat, cur_lon, pickup_df)
                 if idx is None:
                     break
+
                 can_pick = int(min(
                     df.loc[idx, "남은수거"],
                     capacity - load,
-                    trip_target - picked_this_round,
+                    trip_target - picked_this_trip,
                 ))
                 if can_pick <= 0:
                     break
@@ -667,10 +671,12 @@ def sequential_vehicle_routes(candidates: pd.DataFrame, vehicle_count: int, capa
                 df.loc[idx, "남은수거"] -= can_pick
                 df.loc[idx, "처리수거량"] += can_pick
                 load += can_pick
-                picked_this_round += can_pick
+                picked_this_trip += can_pick
+                route["picked"] += can_pick
+
                 cur_lat, cur_lon = float(df.loc[idx, "위도"]), float(df.loc[idx, "경도"])
-                steps.append({
-                    "visit_order": len(steps),
+                route["steps"].append({
+                    "visit_order": len(route["steps"]),
                     "name": str(df.loc[idx, "대여소명"]),
                     "lat": cur_lat,
                     "lon": cur_lon,
@@ -678,37 +684,37 @@ def sequential_vehicle_routes(candidates: pd.DataFrame, vehicle_count: int, capa
                     "qty": can_pick,
                     "load_after": load,
                     "station_norm": str(df.loc[idx, "station_norm"]),
-                    "round": rounds_done + 1,
+                    "round": round_no,
                 })
 
+            # 수거를 못 했으면 이 차량은 이번 회차 건너뜀
             if load <= 0:
-                break
+                current_pos[k] = (cur_lat, cur_lon)
+                continue
 
-            rounds_done += 1
-
-            # 2) 싣고 있는 자전거를 재배치
-            while load > 0 and df["남은재배치"].sum() > 0 and delivered_by_vehicle < vehicle_target:
+            # 2) 재배치: 가까운 부족 후보부터 싣고 있는 자전거를 내려놓는다.
+            delivered_this_trip = 0
+            while load > 0 and int(df["남은재배치"].sum()) > 0:
                 delivery_df = df[df["남은재배치"] > 0].copy()
                 if delivery_df.empty:
                     break
                 idx = nearest_idx(cur_lat, cur_lon, delivery_df)
                 if idx is None:
                     break
-                can_drop = int(min(
-                    df.loc[idx, "남은재배치"],
-                    load,
-                    vehicle_target - delivered_by_vehicle,
-                ))
+
+                can_drop = int(min(df.loc[idx, "남은재배치"], load))
                 if can_drop <= 0:
                     break
 
                 df.loc[idx, "남은재배치"] -= can_drop
                 df.loc[idx, "처리재배치량"] += can_drop
                 load -= can_drop
-                delivered_by_vehicle += can_drop
+                delivered_this_trip += can_drop
+                route["delivered"] += can_drop
+
                 cur_lat, cur_lon = float(df.loc[idx, "위도"]), float(df.loc[idx, "경도"])
-                steps.append({
-                    "visit_order": len(steps),
+                route["steps"].append({
+                    "visit_order": len(route["steps"]),
                     "name": str(df.loc[idx, "대여소명"]),
                     "lat": cur_lat,
                     "lon": cur_lon,
@@ -716,19 +722,21 @@ def sequential_vehicle_routes(candidates: pd.DataFrame, vehicle_count: int, capa
                     "qty": can_drop,
                     "load_after": load,
                     "station_norm": str(df.loc[idx, "station_norm"]),
-                    "round": rounds_done,
+                    "round": round_no,
                 })
 
-        if len(steps) <= 1:
-            steps = []
+            if delivered_this_trip > 0:
+                route["rounds"] += 1
 
-        routes.append({
-            "vehicle": k,
-            "steps": steps,
-            "distance_km": 0.0,
-            "osrm_failures": 0,
-            "rounds": rounds_done,
-        })
+            # 다음 회차는 해당 차량의 마지막 재배치 지점에서 이어서 시작한다.
+            # 실제 운영에서 반드시 복귀하지 않고 현장에서 다음 요청을 수행하는 형태를 반영.
+            current_pos[k] = (cur_lat, cur_lon)
+            current_load[k] = load
+
+    # 출발만 있고 실제 수거/재배치가 없는 차량은 배정 없음으로 처리한다.
+    for r in routes:
+        if len(r["steps"]) <= 1:
+            r["steps"] = []
 
     df["남은불균형"] = df["남은재배치"]
     return routes, df
