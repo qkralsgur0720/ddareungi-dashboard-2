@@ -54,8 +54,8 @@ DEFAULT_VEHICLE_COUNT = 2
 DEFAULT_CAPACITY = 15
 DEFAULT_PICKUP_TOP_N = 8
 DEFAULT_DELIVERY_TOP_N = 8
-DEFAULT_LOW_RATIO = 0.30
-DEFAULT_HIGH_RATIO = 0.80
+DEFAULT_MIN_STOCK = 3
+DEFAULT_SAFETY_FACTOR = 1.20
 
 # ------------------------------------------------------------
 # 스타일: metric 글자 잘림 방지용 카드
@@ -464,11 +464,25 @@ def merge_priority(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_candidates(rt_df: pd.DataFrame, demand_df: pd.DataFrame, low_ratio: float, high_ratio: float,
-                     pickup_top_n: int, delivery_top_n: int) -> pd.DataFrame:
-    """실시간 재고 + 예측수요로 재배치 후보와 공급수거 후보 생성."""
+def build_candidates(rt_df: pd.DataFrame, demand_df: pd.DataFrame,
+                     pickup_top_n: int, delivery_top_n: int,
+                     min_stock: int, safety_factor: float) -> pd.DataFrame:
+    """
+    실시간 재고 + 예측수요로 재배치 후보와 공급수거 후보 생성.
+
+    이번 버전에서는 거치대 수를 의사결정 기준에서 제외한다.
+    이유: 따릉이는 거치대 외부에 주차되는 경우가 많고, 실시간 현재 자전거 수는
+    대여소 주변 위치 기반으로 집계되는 값에 가깝기 때문이다.
+
+    핵심 기준:
+    - 예상재고 = 현재자전거수 + 예측반납수요 - 예측대여수요
+    - 안전재고 = max(최소안전재고, 예측대여수요 × 안전계수)
+    - 재배치필요량 = max(0, 안전재고 - 예상재고)
+    - 공급가능량 = max(0, 예상재고 - 안전재고)
+    """
     if rt_df.empty:
         return pd.DataFrame()
+
     df = rt_df.merge(demand_df, on="station_norm", how="left")
     df = merge_priority(df)
 
@@ -478,36 +492,29 @@ def build_candidates(rt_df: pd.DataFrame, demand_df: pd.DataFrame, low_ratio: fl
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     df["예상재고"] = df["current_bikes"] + df["예측반납수요"] - df["예측대여수요"]
-    df["부족기준재고"] = df["rack_count"] * low_ratio
-    df["과잉기준재고"] = df["rack_count"] * high_ratio
-    df["수거필요량_raw"] = (df["예상재고"] - df["과잉기준재고"]).clip(lower=0)
-    df["재배치필요량_raw"] = (df["부족기준재고"] - df["예상재고"]).clip(lower=0)
+    df["안전재고"] = np.maximum(float(min_stock), df["예측대여수요"] * float(safety_factor))
 
-    # 재배치 후보: 부족량 큰 곳 우선
+    # 부족 판단: 앞으로의 예상재고가 안전재고보다 낮으면 재배치 후보
+    df["재배치필요량_raw"] = (df["안전재고"] - df["예상재고"]).clip(lower=0)
+
     deliveries = df[df["재배치필요량_raw"] > 0].copy()
     deliveries["후보유형"] = "재배치"
     deliveries["필요량"] = np.ceil(deliveries["재배치필요량_raw"]).astype(int)
-    deliveries["후보점수"] = deliveries["필요량"] * (1 + deliveries["우선순위점수"].fillna(0))
+    deliveries["재배치점수"] = (
+        0.45 * deliveries["필요량"] +
+        0.35 * deliveries["예측대여수요"] +
+        0.20 * deliveries["우선순위점수"].fillna(0)
+    )
+    deliveries["후보점수"] = deliveries["재배치점수"]
     deliveries = deliveries.sort_values(["후보점수", "필요량"], ascending=False).head(delivery_top_n)
 
-    # 1차 과잉수거 후보
-    pickups_over = df[df["수거필요량_raw"] > 0].copy()
-    pickups_over["후보유형"] = "과잉수거"
-    pickups_over["필요량"] = np.ceil(pickups_over["수거필요량_raw"]).astype(int)
-    pickups_over["후보점수"] = pickups_over["필요량"] * (1 + pickups_over["우선순위점수"].fillna(0))
-
-    # 2차 공급수거 후보: 현재 자전거가 많고, 예측대여수요·평소이용빈도는 낮은 곳
-    # 수거 가능량은 부족기준 이하로 떨어지지 않는 범위
+    # 공급수거 후보: 현재/예상 재고가 안전재고보다 충분히 높은 곳.
+    # 재배치 후보는 공급 후보에서 제외한다.
     supply = df.copy()
-    supply["공급가능량"] = (supply["current_bikes"] - supply["부족기준재고"]).clip(lower=0)
-    # 최소 1대 이상 공급 가능해야 함
+    delivery_ids = set(deliveries["station_norm"].astype(str)) if not deliveries.empty else set()
+    supply = supply[~supply["station_norm"].astype(str).isin(delivery_ids)].copy()
+    supply["공급가능량"] = (supply["예상재고"] - supply["안전재고"]).clip(lower=0)
     supply = supply[supply["공급가능량"] >= 1].copy()
-    # 이미 재배치 후보는 공급 후보에서 제외
-    delivery_ids = set(deliveries["station_norm"].astype(str))
-    supply = supply[~supply["station_norm"].astype(str).isin(delivery_ids)]
-    # 과잉 후보 제외 후 별도 공급 후보
-    over_ids = set(pickups_over["station_norm"].astype(str))
-    supply = supply[~supply["station_norm"].astype(str).isin(over_ids)]
 
     if not supply.empty:
         def minmax(s):
@@ -515,37 +522,33 @@ def build_candidates(rt_df: pd.DataFrame, demand_df: pd.DataFrame, low_ratio: fl
             if s.max() == s.min():
                 return pd.Series(0.0, index=s.index)
             return (s - s.min()) / (s.max() - s.min())
+
         supply["현재자전거점수"] = minmax(supply["current_bikes"])
         supply["공급가능점수"] = minmax(supply["공급가능량"])
         supply["낮은예측대여점수"] = 1 - minmax(supply["예측대여수요"])
         supply["낮은이용빈도점수"] = 1 - minmax(supply["평소이용빈도"])
         supply["후보점수"] = (
-            0.35 * supply["현재자전거점수"] +
+            0.40 * supply["현재자전거점수"] +
             0.35 * supply["공급가능점수"] +
-            0.20 * supply["낮은예측대여점수"] +
+            0.15 * supply["낮은예측대여점수"] +
             0.10 * supply["낮은이용빈도점수"]
         )
         supply["후보유형"] = "공급수거"
+        # 한 대여소에서 너무 많이 빼지 않도록 차량 용량을 상한으로 둔다.
         supply["필요량"] = np.floor(supply["공급가능량"].clip(upper=DEFAULT_CAPACITY)).astype(int)
+        supply = supply[supply["필요량"] > 0].copy()
+        pickups = supply.sort_values(["후보점수", "current_bikes"], ascending=False).head(pickup_top_n)
     else:
-        supply["후보유형"] = []
-
-    # 수거 후보는 과잉 먼저, 부족하면 공급 후보로 채움
-    pickups = pickups_over.sort_values(["후보점수", "필요량"], ascending=False).copy()
-    if len(pickups) < pickup_top_n and not supply.empty:
-        supplement = supply.sort_values(["후보점수", "current_bikes"], ascending=False).head(pickup_top_n - len(pickups))
-        pickups = pd.concat([pickups, supplement], ignore_index=True)
-    else:
-        pickups = pickups.head(pickup_top_n)
+        pickups = pd.DataFrame(columns=df.columns.tolist() + ["후보유형", "필요량", "후보점수"])
 
     candidates = pd.concat([pickups, deliveries], ignore_index=True)
     if candidates.empty:
         return candidates
 
-    # 표시용 및 정수화
     candidates["필요량"] = pd.to_numeric(candidates["필요량"], errors="coerce").fillna(0).astype(int)
     candidates["현재자전거수"] = candidates["current_bikes"].astype(int)
-    candidates["거치대수"] = candidates["rack_count"].astype(int)
+    # 거치대 수는 화면 참고용으로만 유지하고, 후보 선정·불균형 계산에는 사용하지 않는다.
+    candidates["거치대수_참고"] = candidates["rack_count"].astype(int) if "rack_count" in candidates.columns else 0
     candidates["위도"] = candidates["lat"]
     candidates["경도"] = candidates["lon"]
     candidates["대여소명"] = candidates["대여소명"].fillna(candidates["station_name"])
@@ -677,7 +680,7 @@ def sequential_vehicle_routes(candidates: pd.DataFrame, vehicle_count: int, capa
         routes.append({"vehicle": k, "steps": steps, "distance_km": 0.0, "osrm_failures": 0})
 
     # 결과 테이블
-    df["남은불균형"] = df["남은수거"] + df["남은재배치"]
+    df["남은불균형"] = df["남은재배치"]
     return routes, df
 
 # ============================================================
@@ -779,7 +782,7 @@ def make_realtime_map(rt_df: pd.DataFrame, candidates: pd.DataFrame) -> folium.M
             color=color,
             fill=True,
             fill_opacity=0.65,
-            tooltip=f"{r.get('대여소명','')} | 현재 {int(r.get('current_bikes',0))}대 / 거치대 {int(r.get('rack_count',0))}",
+            tooltip=f"{r.get('대여소명','')} | 현재 {int(r.get('current_bikes',0))}대",
         ).add_to(m)
     return m
 
@@ -893,8 +896,8 @@ with st.sidebar:
     capacity = st.slider("차량 용량", 5, 30, DEFAULT_CAPACITY)
     pickup_top_n = st.slider("수거/공급 후보 수", 3, 20, DEFAULT_PICKUP_TOP_N)
     delivery_top_n = st.slider("재배치 후보 수", 3, 20, DEFAULT_DELIVERY_TOP_N)
-    low_ratio = st.slider("부족 기준 비율", 0.1, 0.6, DEFAULT_LOW_RATIO, 0.05)
-    high_ratio = st.slider("과잉 기준 비율", 0.5, 1.2, DEFAULT_HIGH_RATIO, 0.05)
+    min_stock = st.slider("최소 안전재고", 0, 10, DEFAULT_MIN_STOCK, 1)
+    safety_factor = st.slider("예측수요 안전계수", 0.5, 2.0, DEFAULT_SAFETY_FACTOR, 0.1)
 
     st.info("출발지는 여의도 복지관으로 고정됩니다.\n위도 37.518133 / 경도 126.930776")
     run_btn = st.button("🚚 경로 추천 실행", type="primary")
@@ -913,7 +916,7 @@ if run_btn:
         weather_cls = classify_weather(city_weather)
         now = get_current_kst(city_weather.get("weather_time"))
         demand_now = get_base_demand_for_now(now, weather_cls["기상조건"])
-        candidates = build_candidates(rt_df, demand_now, low_ratio, high_ratio, pickup_top_n, delivery_top_n)
+        candidates = build_candidates(rt_df, demand_now, pickup_top_n, delivery_top_n, min_stock, safety_factor)
         routes, result_df = sequential_vehicle_routes(candidates, vehicle_count, capacity)
 
         st.session_state["result_ready"] = True
@@ -927,8 +930,8 @@ if run_btn:
             "area_nm": area_nm,
             "capacity": capacity,
             "vehicle_count": vehicle_count,
-            "low_ratio": low_ratio,
-            "high_ratio": high_ratio,
+            "min_stock": min_stock,
+            "safety_factor": safety_factor,
         }
         st.session_state["rt_df"] = rt_df
         st.session_state["candidates"] = candidates
@@ -971,15 +974,15 @@ st.subheader("② 수거·재배치 후보 및 개선 효과")
 if candidates.empty:
     st.warning("현재 설정에서 후보가 생성되지 않았습니다. 부족 기준/후보 수를 조정해보세요.")
 else:
-    before_imb = int(candidates["필요량"].sum())
-    processed = int(result_df.get("처리수거량", pd.Series(dtype=int)).sum() + result_df.get("처리재배치량", pd.Series(dtype=int)).sum()) if not result_df.empty else 0
+    before_imb = int(candidates.loc[candidates["후보유형"].eq("재배치"), "필요량"].sum())
+    processed = int(result_df.get("처리재배치량", pd.Series(dtype=int)).sum()) if not result_df.empty else 0
     after_imb = int(result_df.get("남은불균형", pd.Series(dtype=int)).sum()) if not result_df.empty else before_imb
     improvement = (before_imb - after_imb) / before_imb * 100 if before_imb > 0 else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    with c1: metric_card("처리 전 후보 불균형", f"{before_imb}대")
-    with c2: metric_card("휴리스틱 처리량", f"{processed}대")
-    with c3: metric_card("처리 후 남은 불균형", f"{after_imb}대")
+    with c1: metric_card("처리 전 부족 불균형", f"{before_imb}대")
+    with c2: metric_card("재배치 처리량", f"{processed}대")
+    with c3: metric_card("처리 후 남은 부족", f"{after_imb}대")
     with c4: metric_card("개선율", f"{improvement:.1f}%")
 
     with st.expander("계산 기준과 해석 보기", expanded=False):
@@ -991,13 +994,18 @@ else:
             **예상재고 계산식**  
             `예상재고 = 현재자전거수 + 예측반납수요 - 예측대여수요`
 
-            **재배치 후보**  
-            `예상재고 < 부족기준비율 × 거치대수` 인 대여소입니다.
+            **거치대 수 처리 방식**  
+            거치대 수는 최종 의사결정 기준에서 제외했습니다. 따릉이는 거치대 외부에 주차되는 경우가 많고, 실시간 자전거 수는 대여소 주변 위치 기준으로 잡히는 값에 가깝기 때문입니다.
 
-            **수거 후보**  
-            먼저 `예상재고 > 과잉기준비율 × 거치대수` 인 과잉 대여소를 찾습니다.  
-            과잉 대여소가 부족하면, 현재 자전거 수가 많고 예측 대여수요와 평소 이용 빈도가 낮은 대여소를 **공급수거 후보**로 추가합니다.  
-            공급수거 후보는 수거 후에도 부족 기준 이하로 떨어지지 않는 범위에서만 수거합니다.
+            **안전재고 계산식**  
+            `안전재고 = max(최소 안전재고, 예측대여수요 × 안전계수)`
+
+            **재배치 후보**  
+            `예상재고 < 안전재고` 인 대여소입니다. 부족량은 `안전재고 - 예상재고`로 계산합니다.
+
+            **공급수거 후보**  
+            `예상재고 > 안전재고` 인 대여소 중에서 현재 자전거 수가 많고, 예측 대여수요와 평소 이용 빈도가 낮은 곳을 우선 선택합니다.
+            공급 가능량은 `예상재고 - 안전재고`이며, 수거 후에도 안전재고 아래로 떨어지지 않는 범위에서만 수거합니다.
 
             **차량 경로 방식**  
             차량 1부터 순차적으로 계산합니다. 각 차량은 여의도 복지관에서 빈 차량으로 출발해 수거 후보에서 자전거를 싣고, 재배치 후보에 배치한 뒤 마지막 재배치 지점에서 종료합니다.  
@@ -1006,7 +1014,7 @@ else:
         )
 
 st.subheader("③ 실시간 대여소 현황 지도")
-st.markdown('<div class="section-help">빨강은 수거/공급 후보, 파랑은 재배치 후보, 주황은 현재 자전거가 많은 대여소입니다.</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-help">빨강은 공급수거 후보, 파랑은 재배치 후보, 주황은 현재 자전거가 많은 대여소입니다. 거치대 수는 판단 기준이 아니라 참고 정보입니다.</div>', unsafe_allow_html=True)
 st_folium(make_realtime_map(rt_df, candidates), width=1200, height=520)
 
 st.subheader("④ 후보 위치 개요 지도")
@@ -1034,7 +1042,7 @@ else:
 st.subheader("⑥ 처리 결과 상세")
 if not result_df.empty:
     show_cols = [
-        "대여소명", "후보유형", "필요량", "현재자전거수", "거치대수", "예상재고",
+        "대여소명", "후보유형", "필요량", "현재자전거수", "예측대여수요", "예측반납수요", "예상재고", "안전재고",
         "처리수거량", "처리재배치량", "남은수거", "남은재배치", "남은불균형"
     ]
     show_cols = [c for c in show_cols if c in result_df.columns]
