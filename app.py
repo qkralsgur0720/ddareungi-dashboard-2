@@ -562,6 +562,14 @@ def build_candidates(
     top_pickup: int,
     top_delivery: int,
 ) -> pd.DataFrame:
+    """실시간 재고와 예측수요를 결합해 후보를 만든다.
+
+    중요 수정점:
+    - 실제 과잉 대여소가 없더라도 재배치만으로 끝나지 않도록,
+      현재 자전거가 비교적 많은 대여소를 '예비 수거 후보'로 추가한다.
+    - 예비 수거 후보는 부족 기준 이하로 떨어뜨리지 않는 범위에서만 수거 가능량을 잡는다.
+    - 따라서 차량 경로는 출발지 → 수거 → 재배치 흐름을 가질 수 있다.
+    """
     if bike_df.empty:
         return pd.DataFrame()
 
@@ -588,8 +596,9 @@ def build_candidates(
         df["우선순위기초점수"] = 0.5
     df["우선순위기초점수"] = pd.to_numeric(df["우선순위기초점수"], errors="coerce").fillna(0.5)
 
-    for c in ["기본예상대여수요", "기본예상반납수요", "현재자전거수", "거치대수"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    for c in ["기본예상대여수요", "기본예상반납수요", "현재자전거수", "거치대수", "위도", "경도"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     df["예측대여수요"] = df["기본예상대여수요"] * coef_out
     df["예측반납수요"] = df["기본예상반납수요"] * coef_in
@@ -607,22 +616,51 @@ def build_candidates(
         + (df["예측대여수요"] - df["예측반납수요"]).abs() * 0.15
     )
 
+    # 1) 실제 과잉 수거 후보
     pickups = df[df["수거필요량"] > 0].sort_values("후보점수", ascending=False).head(top_pickup).copy()
     pickups["후보유형"] = "수거"
     pickups["필요량"] = pickups["수거필요량"]
+    pickups["수거후보구분"] = "과잉수거"
 
+    # 2) 재배치 후보
     deliveries = df[df["재배치필요량"] > 0].sort_values("후보점수", ascending=False).head(top_delivery).copy()
     deliveries["후보유형"] = "재배치"
     deliveries["필요량"] = deliveries["재배치필요량"]
+    deliveries["수거후보구분"] = "-"
+
+    # 3) 과잉 후보가 부족하면, 현재 자전거가 있는 대여소 중 예비 수거 후보를 추가한다.
+    #    예비 수거는 해당 대여소를 부족 기준 아래로 떨어뜨리지 않는 범위에서만 허용한다.
+    need_more_pickups = max(0, int(top_pickup) - len(pickups))
+    delivery_keys = set(deliveries["station_key"].astype(str)) if not deliveries.empty else set()
+    pickup_keys = set(pickups["station_key"].astype(str)) if not pickups.empty else set()
+    if need_more_pickups > 0:
+        reserve = np.maximum(np.ceil(df["부족기준"]), 1)
+        df["예비수거가능량"] = np.maximum(0, np.floor(df["현재자전거수"] - reserve)).astype(int)
+        fallback = df[
+            (df["예비수거가능량"] > 0)
+            & (~df["station_key"].astype(str).isin(delivery_keys))
+            & (~df["station_key"].astype(str).isin(pickup_keys))
+        ].copy()
+        if not fallback.empty:
+            # 현재 자전거가 많고, 우선순위가 높은 곳을 먼저 예비 수거지로 사용
+            fallback["예비수거점수"] = fallback["예비수거가능량"] * 0.7 + fallback["우선순위기초점수"] * 10 * 0.3
+            fallback = fallback.sort_values("예비수거점수", ascending=False).head(need_more_pickups)
+            fallback["후보유형"] = "수거"
+            fallback["필요량"] = fallback["예비수거가능량"].clip(lower=1)
+            fallback["수거필요량"] = fallback["필요량"]
+            fallback["재배치필요량"] = 0
+            # 예비 수거지는 '공급원'이므로 기존 불균형을 키우지 않도록 처리전불균형은 0으로 둔다.
+            fallback["처리전불균형"] = 0
+            fallback["수거후보구분"] = "예비수거"
+            pickups = pd.concat([pickups, fallback], ignore_index=True)
 
     cand = pd.concat([pickups, deliveries], ignore_index=True)
     if cand.empty:
         return cand
 
-    # 지도용 정리
     cand["대여소명"] = cand.get("대여소명_API", cand.get("대여소명_과거", ""))
     keep_cols = [
-        "station_key", "대여소_ID_API", "대여소명", "후보유형", "필요량", "현재자전거수", "거치대수", "거치율",
+        "station_key", "대여소_ID_API", "대여소명", "후보유형", "수거후보구분", "필요량", "현재자전거수", "거치대수", "거치율",
         "예측대여수요", "예측반납수요", "예상재고", "수거필요량", "재배치필요량", "처리전불균형",
         "우선순위기초점수", "후보점수", "위도", "경도"
     ]
@@ -651,108 +689,134 @@ def nearest_index(current: Tuple[float, float], rows: pd.DataFrame) -> Optional[
 
 
 def balanced_greedy_routes(candidates: pd.DataFrame, depot_lat: float, depot_lon: float, vehicle_count: int, capacity: int) -> Tuple[List[List[Dict[str, Any]]], pd.DataFrame, Dict[str, float]]:
-    """
-    차량 1대가 모든 후보를 독식하지 않도록 후보를 차량별로 먼저 분배한 뒤,
-    각 차량 안에서 수거→재배치 순서로 경로를 구성한다.
+    """수거 후 재배치가 일어나는 차량별 휴리스틱 경로를 만든다.
 
-    - 수거 후보와 재배치 후보를 후보점수 순으로 정렬
-    - 차량 번호별로 round-robin 분배
-    - 각 차량은 자기에게 배정된 후보 안에서 가까운 지점 우선 방문
-    - 관리소 출발 차량은 재배치 업무를 수행할 수 있도록 출발 시 적재량을 싣고 출발할 수 있음
-    - 배포용 휴리스틱이므로 최적해가 아니라 발표용 경로 추천임
+    핵심 원칙
+    1) 차량은 빈 차량으로 출발한다.
+    2) 각 차량은 먼저 수거 후보를 방문해 자전거를 싣는다.
+    3) 이후 재배치 후보를 방문해 부족 대여소에 배치한다.
+    4) 경로는 마지막 재배치 지점에서 종료한다. 발표용 지도에서는 복귀선을 그리지 않는다.
+    5) 한 차량이 모든 후보를 독식하지 않도록 재배치 후보를 차량별로 round-robin 배정한다.
     """
     cand = candidates.copy().reset_index(drop=True)
-    cand["남은수거"] = cand.get("수거필요량", 0).astype(float)
-    cand["남은재배치"] = cand.get("재배치필요량", 0).astype(float)
+    if cand.empty or vehicle_count <= 0:
+        return [], cand, {"before": 0, "processed": 0, "after": 0, "improve": 0}
+
+    cand["남은수거"] = pd.to_numeric(cand.get("수거필요량", 0), errors="coerce").fillna(0).astype(float)
+    cand["남은재배치"] = pd.to_numeric(cand.get("재배치필요량", 0), errors="coerce").fillna(0).astype(float)
     cand["처리수거량"] = 0.0
     cand["처리재배치량"] = 0.0
     cand["배정차량"] = np.nan
 
-    if cand.empty or vehicle_count <= 0:
-        return [], cand, {"before": 0, "processed": 0, "after": 0, "improve": 0}
-
-    # 후보 유형별로 정렬 후 차량에 균등 배정
     pickup_idx = cand[cand["남은수거"] > 0].sort_values("후보점수", ascending=False).index.tolist()
     delivery_idx = cand[cand["남은재배치"] > 0].sort_values("후보점수", ascending=False).index.tolist()
 
-    for n, idx in enumerate(pickup_idx):
-        cand.loc[idx, "배정차량"] = n % vehicle_count
+    # 재배치 후보를 차량별로 균등 배정한다. 이 값이 실제 처리 목표가 된다.
+    delivery_assignments = {k: [] for k in range(vehicle_count)}
     for n, idx in enumerate(delivery_idx):
-        # 이미 수거 후보이기도 한 경우 기존 배정 유지
-        if pd.isna(cand.loc[idx, "배정차량"]):
-            cand.loc[idx, "배정차량"] = n % vehicle_count
+        k = n % vehicle_count
+        delivery_assignments[k].append(idx)
+        cand.loc[idx, "배정차량"] = k
 
-    # 혹시 배정이 안 된 후보가 있으면 점수순으로 분배
-    unassigned = cand[cand["배정차량"].isna()].sort_values("후보점수", ascending=False).index.tolist()
-    for n, idx in enumerate(unassigned):
-        cand.loc[idx, "배정차량"] = n % vehicle_count
+    # 수거 후보도 균등 배정하되, 경로 생성 시 부족하면 다른 차량의 예비 수거 후보도 사용할 수 있게 한다.
+    pickup_assignments = {k: [] for k in range(vehicle_count)}
+    for n, idx in enumerate(pickup_idx):
+        k = n % vehicle_count
+        pickup_assignments[k].append(idx)
+        if pd.isna(cand.loc[idx, "배정차량"]):
+            cand.loc[idx, "배정차량"] = k
 
     routes: List[List[Dict[str, Any]]] = []
 
     for k in range(vehicle_count):
-        assigned = cand[cand["배정차량"] == k].copy()
-        # 재배치 후보가 있는 차량은 여의도 복지관에서 자전거를 싣고 출발한다고 가정한다.
-        # 그렇지 않으면 수거 전용 차량처럼 빈 차량으로 출발한다.
-        has_delivery = (not assigned.empty) and (assigned["남은재배치"].sum() > 0)
-        load = float(capacity if has_delivery else 0)
         cur = (depot_lat, depot_lon)
-        start_action = "적재 출발" if load > 0 else "출발"
-        route = [{"type": "depot", "name": DEFAULT_DEPOT_NAME, "lat": depot_lat, "lon": depot_lon, "action": start_action, "amount": int(round(load)), "load_after": int(round(load))}]
+        load = 0.0
+        route = [{"type": "depot", "name": DEFAULT_DEPOT_NAME, "lat": depot_lat, "lon": depot_lon, "action": "출발", "amount": 0, "load_after": 0}]
 
-        if assigned.empty:
-            # 이 차량에 배정된 후보가 없으면 출발지 표시만 유지
-            route.append({"type": "depot", "name": DEFAULT_DEPOT_NAME, "lat": depot_lat, "lon": depot_lon, "action": "대기", "amount": 0, "load_after": int(round(load))})
+        remaining_deliveries = list(delivery_assignments.get(k, []))
+        own_pickups = list(pickup_assignments.get(k, []))
+
+        if not remaining_deliveries:
+            route.append({"type": "depot", "name": DEFAULT_DEPOT_NAME, "lat": depot_lat, "lon": depot_lon, "action": "대기", "amount": 0, "load_after": 0})
             routes.append(route)
             continue
 
         safety = 0
-        while safety < 80:
+        while safety < 120 and remaining_deliveries:
             safety += 1
-            assigned_idx = cand[cand["배정차량"] == k].index
-            pickups = cand.loc[assigned_idx][(cand.loc[assigned_idx, "남은수거"] > 0) & (load < capacity)].copy()
-            deliveries = cand.loc[assigned_idx][(cand.loc[assigned_idx, "남은재배치"] > 0) & (load > 0)].copy()
+            # 남은 재배치 필요량
+            remaining_delivery_need = float(cand.loc[remaining_deliveries, "남은재배치"].clip(lower=0).sum())
+            if remaining_delivery_need <= 0:
+                break
 
-            # 우선순위: 적재량이 있으면 가까운 재배치 후보부터 처리하고,
-            # 적재 공간이 생기면 수거 후보를 처리한다.
-            if load > 0 and not deliveries.empty:
-                idx = nearest_index(cur, deliveries)
-                amount = min(load, cand.loc[idx, "남은재배치"])
-                cand.loc[idx, "남은재배치"] -= amount
-                cand.loc[idx, "처리재배치량"] += amount
-                load -= amount
-                row = cand.loc[idx]
-                action = "재배치"
-            elif load < capacity and not pickups.empty:
-                idx = nearest_index(cur, pickups)
-                amount = min(capacity - load, cand.loc[idx, "남은수거"])
+            # 적재량이 없으면 반드시 수거부터 한다.
+            if load <= 0:
+                available_own = [idx for idx in own_pickups if cand.loc[idx, "남은수거"] > 0]
+                available_all = [idx for idx in pickup_idx if cand.loc[idx, "남은수거"] > 0]
+                available = available_own if available_own else available_all
+                if not available:
+                    # 더 이상 수거할 자전거가 없으면 남은 재배치를 처리할 수 없음
+                    break
+                rows = cand.loc[available].copy()
+                idx = nearest_index(cur, rows)
+                if idx is None:
+                    break
+                amount = min(float(capacity - load), float(cand.loc[idx, "남은수거"]), remaining_delivery_need)
+                if amount <= 0:
+                    break
                 cand.loc[idx, "남은수거"] -= amount
                 cand.loc[idx, "처리수거량"] += amount
                 load += amount
                 row = cand.loc[idx]
-                action = "수거"
-            else:
-                break
+                cur = (float(row["위도"]), float(row["경도"]))
+                route.append({
+                    "type": "수거",
+                    "station_key": row.get("station_key", ""),
+                    "name": row.get("대여소명", ""),
+                    "lat": float(row["위도"]),
+                    "lon": float(row["경도"]),
+                    "action": "수거",
+                    "amount": int(round(amount)),
+                    "load_after": int(round(load)),
+                })
+                continue
 
+            # 적재량이 있으면 해당 차량의 재배치 후보 중 가까운 곳부터 처리한다.
+            active_deliveries = [idx for idx in remaining_deliveries if cand.loc[idx, "남은재배치"] > 0]
+            if not active_deliveries:
+                break
+            rows = cand.loc[active_deliveries].copy()
+            idx = nearest_index(cur, rows)
+            if idx is None:
+                break
+            amount = min(float(load), float(cand.loc[idx, "남은재배치"]))
             if amount <= 0:
                 break
-
+            cand.loc[idx, "남은재배치"] -= amount
+            cand.loc[idx, "처리재배치량"] += amount
+            load -= amount
+            row = cand.loc[idx]
             cur = (float(row["위도"]), float(row["경도"]))
             route.append({
-                "type": action,
+                "type": "재배치",
                 "station_key": row.get("station_key", ""),
                 "name": row.get("대여소명", ""),
                 "lat": float(row["위도"]),
                 "lon": float(row["경도"]),
-                "action": action,
+                "action": "재배치",
                 "amount": int(round(amount)),
                 "load_after": int(round(load)),
             })
 
-        route.append({"type": "depot", "name": DEFAULT_DEPOT_NAME, "lat": depot_lat, "lon": depot_lon, "action": "복귀", "amount": 0, "load_after": int(round(load))})
+            remaining_deliveries = [idx for idx in remaining_deliveries if cand.loc[idx, "남은재배치"] > 0]
+
+        # 복귀선은 그리지 않는다. 마지막 방문 지점이 재배치면 그 지점에서 작업 종료로 표시한다.
+        if len(route) == 1:
+            route.append({"type": "depot", "name": DEFAULT_DEPOT_NAME, "lat": depot_lat, "lon": depot_lon, "action": "대기", "amount": 0, "load_after": 0})
         routes.append(route)
 
     cand["최적화후재고"] = cand["예상재고"] - cand["처리수거량"] + cand["처리재배치량"]
-    cand["남은불균형"] = cand["남은수거"] + cand["남은재배치"]
+    cand["남은불균형"] = cand["남은수거"].clip(lower=0) + cand["남은재배치"].clip(lower=0)
 
     before = float(candidates["처리전불균형"].sum()) if not candidates.empty else 0.0
     processed = float(cand["처리수거량"].sum() + cand["처리재배치량"].sum())
@@ -957,7 +1021,7 @@ def make_vehicle_route_map(route: List[Dict[str, Any]], vehicle_no: int) -> Tupl
 # ============================================================
 
 st.title("🚲 여의도 따릉이 수거·재배치 경로 추천 대시보드")
-st.caption("배포용 버전: 실시간 API + 과거 수요모델 + 휴리스틱 경로 추천. 출발지는 여의도 복지관으로 고정하고, 차량별 경로 지도는 각각 분리해서 표시합니다. 재배치 차량은 출발 시 자전거를 싣고 출발합니다.")
+st.caption("배포용 버전: 실시간 API + 과거 수요모델 + 휴리스틱 경로 추천. 출발지는 여의도 복지관으로 고정하고, 차량별 경로 지도는 각각 분리해서 표시합니다. 차량은 빈 차량으로 출발해 수거 후 재배치하며, 마지막 재배치 지점에서 경로를 마무리합니다.")
 
 # session state 초기화
 for key in ["candidates", "routes", "processed", "summary", "weather", "weather_cond", "ctx"]:
@@ -1013,7 +1077,7 @@ top_delivery = st.sidebar.slider("재배치 후보 수", min_value=1, max_value=
 st.sidebar.subheader("출발지")
 depot_lat = DEFAULT_DEPOT_LAT
 depot_lon = DEFAULT_DEPOT_LON
-st.sidebar.info(f"{DEFAULT_DEPOT_NAME}\n위도 {depot_lat:.6f}, 경도 {depot_lon:.6f}\n재배치 차량은 여기서 자전거를 싣고 출발")
+st.sidebar.info(f"{DEFAULT_DEPOT_NAME}\n위도 {depot_lat:.6f}, 경도 {depot_lon:.6f}\n차량은 여기서 빈 차량으로 출발")
 
 col_run, col_clear = st.sidebar.columns(2)
 run_clicked = col_run.button("경로 추천 실행", type="primary", use_container_width=True)
@@ -1136,8 +1200,9 @@ with st.expander("계산 기준과 해석 보기", expanded=False):
         수거필요량 = max(0, 예상재고 - U×거치대수), 현재 U = <b>{U:.2f}</b><br>
         재배치필요량 = max(0, L×거치대수 - 예상재고), 현재 L = <b>{L:.2f}</b><br><br>
         <b>4. 경로 추천 방식</b><br>
-        배포용 대시보드는 Gurobi가 아니라 휴리스틱 방식입니다. 수거 후보가 있으면 수거 후 재배치하고, 재배치 후보만 있는 경우에는 차량이 여의도 복지관에서 자전거를 싣고 출발하여 부족 대여소에 배치합니다.<br>
-        출발지는 여의도 복지관으로 고정했습니다. 시간 조건은 Streamlit 서버 시간이 아니라 한국시간(KST)을 기준으로 판정합니다.<br>차량 1대가 모든 후보를 처리하지 않도록 수거·재배치 후보를 후보점수 순으로 차량별 균등 배정한 뒤, 각 차량 안에서 가까운 지점 우선으로 경로를 구성합니다.<br>각 차량 지도는 OSRM 도로 경로를 호출해 실제 도로 흐름에 가깝게 표시하며, 경로 선 위의 화살표가 진행 방향을 나타냅니다.
+        배포용 대시보드는 Gurobi가 아니라 휴리스틱 방식입니다. 차량은 여의도 복지관에서 빈 차량으로 출발하고, 먼저 수거 후보를 방문해 자전거를 싣습니다. 이후 재배치 후보를 방문해 부족 대여소에 배치합니다.<br>
+        실제 과잉 수거 후보가 부족한 경우에는 현재 자전거가 비교적 많은 대여소를 예비 수거 후보로 사용합니다. 단, 해당 대여소가 부족 기준 이하로 떨어지지 않는 범위에서만 수거 가능량을 잡습니다.<br>
+        출발지는 여의도 복지관으로 고정했습니다. 시간 조건은 Streamlit 서버 시간이 아니라 한국시간(KST)을 기준으로 판정합니다.<br>차량 1대가 모든 후보를 처리하지 않도록 재배치 후보를 후보점수 순으로 차량별 균등 배정하고, 각 차량은 수거→재배치 순서로 경로를 구성합니다.<br>각 차량 지도는 OSRM 도로 경로를 호출해 실제 도로 흐름에 가깝게 표시하며, 경로 선 위의 화살표가 진행 방향을 나타냅니다. 복귀선은 그리지 않고 마지막 재배치 지점에서 경로가 끝납니다.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1147,7 +1212,7 @@ with st.expander("계산 기준과 해석 보기", expanded=False):
 col1, col2 = st.columns(2)
 with col1:
     st.markdown("#### 수거 후보")
-    cols = ["대여소명", "필요량", "현재자전거수", "거치대수", "예상재고", "후보점수"]
+    cols = ["대여소명", "수거후보구분", "필요량", "현재자전거수", "거치대수", "예상재고", "후보점수"]
     st.dataframe(candidates[candidates["후보유형"] == "수거"][[c for c in cols if c in candidates.columns]], use_container_width=True, hide_index=True)
 with col2:
     st.markdown("#### 재배치 후보")
@@ -1161,7 +1226,7 @@ st_folium(overview_map, width=None, height=480, returned_objects=[])
 
 # 차량별 경로 지도
 st.subheader("④ 차량별 경로 지도")
-st.caption("각 탭에는 해당 차량의 경로만 표시됩니다. 초록색 선은 OSRM 도로 경로이며, 선 위의 큰 삼각 화살표가 진행 방향입니다.")
+st.caption("각 탭에는 해당 차량의 경로만 표시됩니다. 초록색 선은 OSRM 도로 경로이며, 선 위의 큰 삼각 화살표가 진행 방향입니다. 복귀 경로는 표시하지 않고 마지막 재배치 지점에서 종료합니다.")
 
 tabs = st.tabs([f"차량 {i+1}" for i in range(len(routes))])
 route_tables = []
@@ -1183,7 +1248,7 @@ for i, tab in enumerate(tabs):
 # 처리 결과표
 st.subheader("⑤ 처리 결과 상세")
 show_cols = [
-    "대여소명", "후보유형", "필요량", "현재자전거수", "거치대수", "예상재고", "처리수거량", "처리재배치량", "남은수거", "남은재배치", "남은불균형"
+    "대여소명", "후보유형", "수거후보구분", "필요량", "현재자전거수", "거치대수", "예상재고", "처리수거량", "처리재배치량", "남은수거", "남은재배치", "남은불균형"
 ]
 st.dataframe(processed[[c for c in show_cols if c in processed.columns]], use_container_width=True, hide_index=True)
 
