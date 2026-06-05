@@ -535,8 +535,10 @@ def build_candidates(rt_df: pd.DataFrame, demand_df: pd.DataFrame,
             0.10 * supply["낮은이용빈도점수"]
         )
         supply["후보유형"] = "공급수거"
-        # 한 대여소에서 너무 많이 빼지 않도록 차량 용량을 상한으로 둔다.
-        supply["필요량"] = np.floor(supply["공급가능량"].clip(upper=DEFAULT_CAPACITY)).astype(int)
+        # 공급 가능량은 대여소별 실제 여유량으로 둔다.
+        # 차량 용량은 "한 번에 싣는 양"의 제한이지, 대여소 전체 수거 가능량의 제한이 아니다.
+        # 따라서 한 대여소에서도 여러 회차에 걸쳐 15대 이상 수거될 수 있다.
+        supply["필요량"] = np.floor(supply["공급가능량"]).astype(int)
         supply = supply[supply["필요량"] > 0].copy()
         pickups = supply.sort_values(["후보점수", "current_bikes"], ascending=False).head(pickup_top_n)
     else:
@@ -950,11 +952,11 @@ with st.sidebar:
             break
     area_nm = st.selectbox("도시데이터 장소명", place_options, index=default_idx)
 
-    vehicle_count = st.slider("차량 수", 1, 4, DEFAULT_VEHICLE_COUNT)
-    capacity = st.slider("차량 용량", 5, 30, DEFAULT_CAPACITY)
-    max_rounds = st.slider("차량당 최대 수거·재배치 회차", 1, 6, DEFAULT_MAX_ROUNDS_PER_VEHICLE)
-    pickup_top_n = st.slider("수거/공급 후보 수", 3, 20, DEFAULT_PICKUP_TOP_N)
-    delivery_top_n = st.slider("재배치 후보 수", 3, 20, DEFAULT_DELIVERY_TOP_N)
+    vehicle_count = st.slider("차량 수", 1, 6, DEFAULT_VEHICLE_COUNT)
+    capacity = st.slider("차량 1회 최대 적재량", 5, 30, DEFAULT_CAPACITY)
+    max_rounds = st.slider("차량당 최대 수거·재배치 회차", 1, 8, DEFAULT_MAX_ROUNDS_PER_VEHICLE)
+    pickup_top_n = st.slider("수거/공급 후보 수", 3, 60, max(DEFAULT_PICKUP_TOP_N, 20))
+    delivery_top_n = st.slider("재배치 후보 수", 3, 60, max(DEFAULT_DELIVERY_TOP_N, 20))
     min_stock = st.slider("최소 안전재고", 0, 10, DEFAULT_MIN_STOCK, 1)
     safety_factor = st.slider("예측수요 안전계수", 0.5, 2.0, DEFAULT_SAFETY_FACTOR, 0.1)
 
@@ -1039,13 +1041,27 @@ else:
     after_imb = int(result_df.get("남은불균형", pd.Series(dtype=int)).sum()) if not result_df.empty else before_imb
     improvement = (before_imb - after_imb) / before_imb * 100 if before_imb > 0 else 0
 
-    total_available_work = int(ctx["vehicle_count"] * ctx["capacity"] * ctx["max_rounds"])
-    c1, c2, c3, c4, c5 = st.columns(5)
+    theoretical_capacity = int(ctx["vehicle_count"] * ctx["capacity"] * ctx["max_rounds"])
+    supply_available = int(candidates.loc[candidates["후보유형"].isin(["과잉수거", "공급수거"]), "필요량"].sum())
+    actual_cap = int(min(theoretical_capacity, before_imb, supply_available))
+
+    c1, c2, c3, c4 = st.columns(4)
     with c1: metric_card("처리 전 부족 불균형", f"{before_imb}대")
     with c2: metric_card("재배치 처리량", f"{processed}대")
     with c3: metric_card("처리 후 남은 부족", f"{after_imb}대")
     with c4: metric_card("개선율", f"{improvement:.1f}%")
-    with c5: metric_card("최대 운반 가능량", f"{total_available_work}대")
+
+    c5, c6, c7 = st.columns(3)
+    with c5: metric_card("이론 운반 가능량", f"{theoretical_capacity}대")
+    with c6: metric_card("공급 가능량", f"{supply_available}대")
+    with c7: metric_card("실제 처리 상한", f"{actual_cap}대")
+
+    if theoretical_capacity > processed and processed == before_imb:
+        st.info("이론 운반 가능량보다 처리량이 적은 이유는 현재 선택된 재배치 후보의 부족량을 이미 모두 처리했기 때문입니다. 더 많은 처리를 보려면 재배치 후보 수를 늘리거나 안전재고 기준을 높여 후보를 더 많이 생성해야 합니다.")
+    elif theoretical_capacity > processed and processed == supply_available:
+        st.info("이론 운반 가능량보다 처리량이 적은 이유는 현재 선택된 공급 후보에서 가져올 수 있는 자전거 수가 제한되어 있기 때문입니다. 수거/공급 후보 수를 늘리거나 안전재고 기준을 낮추면 공급 가능량이 늘 수 있습니다.")
+    elif theoretical_capacity > processed:
+        st.info("이론 운반 가능량은 차량 수 × 1회 적재량 × 회차 수로 계산한 최대치입니다. 실제 처리량은 재배치 필요량과 공급 가능량 중 작은 값에 의해 제한됩니다.")
 
     with st.expander("계산 기준과 해석 보기", expanded=False):
         st.markdown(
